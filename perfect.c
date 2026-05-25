@@ -19,6 +19,7 @@ typedef struct {
   Bitboard bb;
   int size;
   int min_sq;
+  int cache_idx;
 } Orbit;
 
 typedef struct {
@@ -28,6 +29,7 @@ typedef struct {
 
 typedef struct {
   Bitboard subset[MAX_SUBSETS];
+  unsigned char stabilizer[MAX_SUBSETS];
   int n;
 } SubsetList;
 
@@ -63,6 +65,7 @@ static const unsigned char subgroup_mask[SUBGROUP_COUNT] = {
   0xff  // full D8
 };
 static OrbitList subgroup_orbits[SUBGROUP_COUNT];
+static SubsetList subset_cache[SUBGROUP_COUNT][MAX_ORBITS][BOARD_SIDE + 1];
 static int initialized;
 
 static int bitcount(Bitboard b)
@@ -152,6 +155,8 @@ static int subgroup_index(unsigned char group_mask)
   exit(1);
 }
 
+static Bitboard canonical_bb(Bitboard bb, unsigned char group_mask);
+
 static OrbitList build_empty_orbits(unsigned char group_mask)
 {
   OrbitList list;
@@ -174,6 +179,40 @@ static OrbitList build_empty_orbits(unsigned char group_mask)
     list.n++;
   }
   qsort(list.orbit, (size_t)list.n, sizeof(list.orbit[0]), orbit_cmp);
+  for (int i = 0; i < list.n; i++) {
+    list.orbit[i].cache_idx = i;
+  }
+  return list;
+}
+
+static unsigned char stabilizer(unsigned char group_mask, Bitboard subset);
+
+static SubsetList build_canonical_subsets(Bitboard orbit, int max_pieces,
+    unsigned char group_mask)
+{
+  SubsetList list;
+
+  memset(&list, 0, sizeof(list));
+  for (Bitboard sub = orbit; sub; sub = (sub - 1) & orbit) {
+    if (bitcount(sub) <= max_pieces && canonical_bb(sub, group_mask) == sub) {
+      unsigned char sub_stabilizer;
+      int j;
+
+      if (list.n >= MAX_SUBSETS) {
+        fprintf(stderr, "too many canonical subsets in orbit\n");
+        exit(1);
+      }
+      sub_stabilizer = stabilizer(group_mask, sub);
+      j = list.n++;
+      while (j > 0 && list.subset[j - 1] > sub) {
+        list.subset[j] = list.subset[j - 1];
+        list.stabilizer[j] = list.stabilizer[j - 1];
+        j--;
+      }
+      list.subset[j] = sub;
+      list.stabilizer[j] = sub_stabilizer;
+    }
+  }
   return list;
 }
 
@@ -189,6 +228,14 @@ void init(void)
   }
   for (int i = 0; i < SUBGROUP_COUNT; i++) {
     subgroup_orbits[i] = build_empty_orbits(subgroup_mask[i]);
+  }
+  for (int s = 0; s < SUBGROUP_COUNT; s++) {
+    for (int o = 0; o < subgroup_orbits[s].n; o++) {
+      for (int max_pieces = 0; max_pieces <= BOARD_SIDE; max_pieces++) {
+        subset_cache[s][o][max_pieces] = build_canonical_subsets(
+            subgroup_orbits[s].orbit[o].bb, max_pieces, subgroup_mask[s]);
+      }
+    }
   }
   initialized = 1;
 }
@@ -254,6 +301,7 @@ static OrbitList make_orbits(unsigned char group_mask, Bitboard occ)
     list.orbit[list.n].bb = orbit;
     list.orbit[list.n].size = empty->orbit[i].size;
     list.orbit[list.n].min_sq = empty->orbit[i].min_sq;
+    list.orbit[list.n].cache_idx = empty->orbit[i].cache_idx;
     list.n++;
   }
   return list;
@@ -305,37 +353,15 @@ static Bitboard canonicalize_target(Bitboard target[], int n,
   return best;
 }
 
-static int subset_cmp(const void *a, const void *b)
+static const SubsetList *canonical_subsets(unsigned char group_mask,
+    const Orbit *orbit, int max_pieces)
 {
-  const Bitboard *sa = (const Bitboard *)a;
-  const Bitboard *sb = (const Bitboard *)b;
+  int max = max_pieces;
 
-  if (*sa < *sb) {
-    return -1;
+  if (max > orbit->size) {
+    max = orbit->size;
   }
-  if (*sa > *sb) {
-    return 1;
-  }
-  return 0;
-}
-
-static SubsetList canonical_subsets(Bitboard orbit, int max_pieces,
-    unsigned char group_mask)
-{
-  SubsetList list;
-
-  memset(&list, 0, sizeof(list));
-  for (Bitboard sub = orbit; sub; sub = (sub - 1) & orbit) {
-    if (bitcount(sub) <= max_pieces && canonical_bb(sub, group_mask) == sub) {
-      if (list.n >= MAX_SUBSETS) {
-        fprintf(stderr, "too many canonical subsets in orbit\n");
-        exit(1);
-      }
-      list.subset[list.n++] = sub;
-    }
-  }
-  qsort(list.subset, (size_t)list.n, sizeof(list.subset[0]), subset_cmp);
-  return list;
+  return &subset_cache[subgroup_index(group_mask)][orbit->cache_idx][max];
 }
 
 static unsigned char stabilizer(unsigned char group_mask, Bitboard subset)
@@ -364,13 +390,12 @@ static Bitboard remaining_allow(Bitboard allow, const OrbitList *orbits,
 static uint64_t count_state(Context *ctx, unsigned char group_mask,
     Bitboard occ, Bitboard allow, int g, int r);
 
-static uint64_t count_after_subset(Context *ctx, unsigned char group_mask,
-    Bitboard occ, int g, int r, const OrbitList *orbits, int orbit_idx,
-    Bitboard allow,
-    Bitboard subset)
+static uint64_t count_after_subset(Context *ctx, Bitboard occ, int g, int r,
+    const OrbitList *orbits, int orbit_idx, Bitboard allow, Bitboard subset,
+    unsigned char subset_stabilizer)
 {
   int used = bitcount(subset);
-  unsigned char new_group = stabilizer(group_mask, subset);
+  unsigned char new_group = subset_stabilizer;
   Bitboard new_occ = occ | subset;
   int new_r = r - used;
   Bitboard new_allow = 0;
@@ -445,14 +470,15 @@ static uint64_t count_state(Context *ctx, unsigned char group_mask,
 
   orbits = make_orbits(group_mask, occ);
   for (int i = 0; i < orbits.n; i++) {
-    SubsetList subsets = canonical_subsets(orbits.orbit[i].bb, r, group_mask);
+    const SubsetList *subsets = canonical_subsets(group_mask,
+        &orbits.orbit[i], r);
 
     if (orbits.orbit[i].bb & ~allow) {
       continue;
     }
-    for (int j = 0; j < subsets.n; j++) {
-      total += count_after_subset(ctx, group_mask, occ, g, r, &orbits, i,
-          allow, subsets.subset[j]);
+    for (int j = 0; j < subsets->n; j++) {
+      total += count_after_subset(ctx, occ, g, r, &orbits, i, allow,
+          subsets->subset[j], subsets->stabilizer[j]);
     }
   }
 
@@ -533,14 +559,15 @@ static uint64_t rank_state(Context *ctx, Bitboard target[],
       actual_subset);
 
   for (int i = 0; i <= actual_orbit; i++) {
-    SubsetList subsets = canonical_subsets(orbits.orbit[i].bb, r, group_mask);
+    const SubsetList *subsets = canonical_subsets(group_mask,
+        &orbits.orbit[i], r);
 
     if (orbits.orbit[i].bb & ~allow) {
       continue;
     }
-    for (int j = 0; j < subsets.n; j++) {
-      if (i == actual_orbit && subsets.subset[j] == actual_subset) {
-        rank += rank_state(ctx, target, stabilizer(group_mask, actual_subset),
+    for (int j = 0; j < subsets->n; j++) {
+      if (i == actual_orbit && subsets->subset[j] == actual_subset) {
+        rank += rank_state(ctx, target, subsets->stabilizer[j],
             occ | actual_subset,
             r - bitcount(actual_subset) > 0
                 ? remaining_allow(allow, &orbits, actual_orbit)
@@ -550,9 +577,9 @@ static uint64_t rank_state(Context *ctx, Bitboard target[],
         return rank;
       }
       if (i < actual_orbit ||
-          (i == actual_orbit && subsets.subset[j] < actual_subset)) {
-        rank += count_after_subset(ctx, group_mask, occ, g, r, &orbits, i,
-            allow, subsets.subset[j]);
+          (i == actual_orbit && subsets->subset[j] < actual_subset)) {
+        rank += count_after_subset(ctx, occ, g, r, &orbits, i, allow,
+            subsets->subset[j], subsets->stabilizer[j]);
       }
     }
   }
@@ -614,27 +641,28 @@ static void unrank_state(Context *ctx, uint64_t *rk, Bitboard group[],
 
   orbits = make_orbits(group_mask, occ);
   for (int i = 0; i < orbits.n; i++) {
-    SubsetList subsets = canonical_subsets(orbits.orbit[i].bb, r, group_mask);
+    const SubsetList *subsets = canonical_subsets(group_mask,
+        &orbits.orbit[i], r);
 
     if (orbits.orbit[i].bb & ~allow) {
       continue;
     }
-    for (int j = 0; j < subsets.n; j++) {
-      uint64_t count = count_after_subset(ctx, group_mask, occ, g, r, &orbits,
-          i, allow, subsets.subset[j]);
+    for (int j = 0; j < subsets->n; j++) {
+      uint64_t count = count_after_subset(ctx, occ, g, r, &orbits, i, allow,
+          subsets->subset[j], subsets->stabilizer[j]);
 
       if (*rk >= count) {
         *rk -= count;
         continue;
       }
 
-      group[g] |= subsets.subset[j];
-      unrank_state(ctx, rk, group, stabilizer(group_mask, subsets.subset[j]),
-          occ | subsets.subset[j],
-          r - bitcount(subsets.subset[j]) > 0
+      group[g] |= subsets->subset[j];
+      unrank_state(ctx, rk, group, subsets->stabilizer[j],
+          occ | subsets->subset[j],
+          r - bitcount(subsets->subset[j]) > 0
               ? remaining_allow(allow, &orbits, i)
               : 0,
-          g, r - bitcount(subsets.subset[j]));
+          g, r - bitcount(subsets->subset[j]));
       return;
     }
   }
