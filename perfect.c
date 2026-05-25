@@ -13,6 +13,7 @@ typedef uint64_t Bitboard;
 #define MAX_GROUPS 16
 #define MAX_ORBITS 64
 #define MAX_SUBSETS 256
+#define SUBGROUP_COUNT 10
 
 typedef struct {
   Bitboard bb;
@@ -49,6 +50,19 @@ typedef struct {
 } Context;
 
 static int map[D8_SIZE][BOARD_SIZE];
+static const unsigned char subgroup_mask[SUBGROUP_COUNT] = {
+  0x01, // identity
+  0x05, // 180-degree rotations
+  0x0f, // rotations
+  0x11, // vertical reflection
+  0x21, // horizontal reflection
+  0x41, // main-diagonal reflection
+  0x81, // anti-diagonal reflection
+  0x35, // 180-degree rotation plus vertical/horizontal reflections
+  0xc5, // 180-degree rotation plus diagonal reflections
+  0xff  // full D8
+};
+static OrbitList subgroup_orbits[SUBGROUP_COUNT];
 static int initialized;
 
 static int bitcount(Bitboard b)
@@ -115,6 +129,54 @@ static Bitboard transform_bb(Bitboard b, int t)
   return out;
 }
 
+static int orbit_cmp(const void *a, const void *b)
+{
+  const Orbit *oa = (const Orbit *)a;
+  const Orbit *ob = (const Orbit *)b;
+
+  if (oa->size != ob->size) {
+    return ob->size - oa->size;
+  }
+  return oa->min_sq - ob->min_sq;
+}
+
+static int subgroup_index(unsigned char group_mask)
+{
+  for (int i = 0; i < SUBGROUP_COUNT; i++) {
+    if (subgroup_mask[i] == group_mask) {
+      return i;
+    }
+  }
+  fprintf(stderr, "internal error: unknown D8 subgroup mask 0x%02x\n",
+      group_mask);
+  exit(1);
+}
+
+static OrbitList build_empty_orbits(unsigned char group_mask)
+{
+  OrbitList list;
+  Bitboard unseen = ~(Bitboard)0;
+
+  memset(&list, 0, sizeof(list));
+  while (unseen) {
+    Bitboard orbit = 0;
+    int seed = take_square(&unseen);
+
+    for (int t = 0; t < D8_SIZE; t++) {
+      if (group_mask & (1u << t)) {
+        orbit |= (Bitboard)1 << map[t][seed];
+      }
+    }
+    unseen &= ~orbit;
+    list.orbit[list.n].bb = orbit;
+    list.orbit[list.n].size = bitcount(orbit);
+    list.orbit[list.n].min_sq = first_square(orbit);
+    list.n++;
+  }
+  qsort(list.orbit, (size_t)list.n, sizeof(list.orbit[0]), orbit_cmp);
+  return list;
+}
+
 void init(void)
 {
   if (initialized) {
@@ -124,6 +186,9 @@ void init(void)
     for (int sq = 0; sq < BOARD_SIZE; sq++) {
       map[t][sq] = transform_square_raw(sq, t);
     }
+  }
+  for (int i = 0; i < SUBGROUP_COUNT; i++) {
+    subgroup_orbits[i] = build_empty_orbits(subgroup_mask[i]);
   }
   initialized = 1;
 }
@@ -170,39 +235,27 @@ static void free_context(Context *ctx)
   memset(ctx, 0, sizeof(*ctx));
 }
 
-static int orbit_cmp(const void *a, const void *b)
-{
-  const Orbit *oa = (const Orbit *)a;
-  const Orbit *ob = (const Orbit *)b;
-
-  if (oa->size != ob->size) {
-    return ob->size - oa->size;
-  }
-  return oa->min_sq - ob->min_sq;
-}
-
 static OrbitList make_orbits(unsigned char group_mask, Bitboard occ)
 {
   OrbitList list;
-  Bitboard unseen = ~occ;
+  const OrbitList *empty = &subgroup_orbits[subgroup_index(group_mask)];
 
   memset(&list, 0, sizeof(list));
-  while (unseen) {
-    Bitboard orbit = 0;
-    int seed = take_square(&unseen);
+  for (int i = 0; i < empty->n; i++) {
+    Bitboard orbit = empty->orbit[i].bb;
 
-    for (int t = 0; t < D8_SIZE; t++) {
-      if (group_mask & (1u << t)) {
-        orbit |= (Bitboard)1 << map[t][seed];
+    if (orbit & occ) {
+      if ((orbit & occ) != orbit) {
+        fprintf(stderr, "internal error: occupancy is not subgroup-invariant\n");
+        exit(1);
       }
+      continue;
     }
-    unseen &= ~orbit;
     list.orbit[list.n].bb = orbit;
-    list.orbit[list.n].size = bitcount(orbit);
-    list.orbit[list.n].min_sq = first_square(orbit);
+    list.orbit[list.n].size = empty->orbit[i].size;
+    list.orbit[list.n].min_sq = empty->orbit[i].min_sq;
     list.n++;
   }
-  qsort(list.orbit, (size_t)list.n, sizeof(list.orbit[0]), orbit_cmp);
   return list;
 }
 
@@ -219,6 +272,34 @@ static Bitboard canonical_bb(Bitboard bb, unsigned char group_mask)
         best = cur;
         have_best = 1;
       }
+    }
+  }
+  return best;
+}
+
+static Bitboard canonicalize_target(Bitboard target[], int n,
+    unsigned char group_mask, Bitboard subset)
+{
+  Bitboard best = 0;
+  int best_t = -1;
+
+  for (int t = 0; t < D8_SIZE; t++) {
+    if (group_mask & (1u << t)) {
+      Bitboard cur = transform_bb(subset, t);
+
+      if (best_t < 0 || cur < best) {
+        best = cur;
+        best_t = t;
+      }
+    }
+  }
+
+  if (best_t < 0) {
+    abort();
+  }
+  if (best != subset) {
+    for (int g = 0; g < n; g++) {
+      target[g] = transform_bb(target[g], best_t);
     }
   }
   return best;
@@ -405,7 +486,7 @@ static int fill_groups_from_squares(int n, const int mult[], const int sq[],
   return 1;
 }
 
-static uint64_t rank_state(Context *ctx, const Bitboard target[],
+static uint64_t rank_state(Context *ctx, Bitboard target[],
     unsigned char group_mask, Bitboard occ, Bitboard allow, int g, int r,
     int *valid)
 {
@@ -448,6 +529,8 @@ static uint64_t rank_state(Context *ctx, const Bitboard target[],
     *valid = 0;
     return 0;
   }
+  actual_subset = canonicalize_target(target, ctx->n, group_mask,
+      actual_subset);
 
   for (int i = 0; i <= actual_orbit; i++) {
     SubsetList subsets = canonical_subsets(orbits.orbit[i].bb, r, group_mask);
@@ -482,8 +565,8 @@ uint64_t rank(int n, int mult[], int sq[])
 {
   Context ctx = make_context(n, mult);
   Bitboard group[MAX_GROUPS];
-  uint64_t best_rank = 0;
-  int have_rank = 0;
+  int valid = 1;
+  uint64_t rk;
 
   if (!fill_groups_from_squares(n, mult, sq, group)) {
     fprintf(stderr, "invalid placement passed to rank\n");
@@ -495,29 +578,14 @@ uint64_t rank(int n, int mult[], int sq[])
     return 0;
   }
 
-  for (int t = 0; t < D8_SIZE; t++) {
-    Bitboard transformed[MAX_GROUPS];
-    int valid = 1;
-    uint64_t rank;
-
-    for (int g = 0; g < n; g++) {
-      transformed[g] = transform_bb(group[g], t);
-    }
-    rank = rank_state(&ctx, transformed, FULL_D8, 0, ~(Bitboard)0, 0, mult[0],
-        &valid);
-    if (valid && (!have_rank || rank < best_rank)) {
-      best_rank = rank;
-      have_rank = 1;
-    }
-  }
-
-  if (!have_rank) {
+  rk = rank_state(&ctx, group, FULL_D8, 0, ~(Bitboard)0, 0, mult[0], &valid);
+  if (!valid) {
     fprintf(stderr, "internal error: placement is not recursively canonical\n");
     exit(1);
   }
 
   free_context(&ctx);
-  return best_rank;
+  return rk;
 }
 
 uint64_t count_unique_positions(int n, int mult[])
@@ -649,6 +717,18 @@ static int test_case(int n, int mult[], int sq[])
     fprintf(stderr, "round trip failed: rank=%" PRIu64 ", rank2=%" PRIu64
         ", count=%" PRIu64 "\n", rk, rk2, count);
     return 0;
+  }
+
+  for (int t = 0; t < D8_SIZE; t++) {
+    int transformed[BOARD_SIZE];
+
+    for (int i = 0; i < total; i++) {
+      transformed[i] = map[t][sq[i]];
+    }
+    if (rank(n, mult, transformed) != rk) {
+      fprintf(stderr, "symmetry-invariance check failed for transform %d\n", t);
+      return 0;
+    }
   }
 
   for (int i = 0; i < total; i++) {
