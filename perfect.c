@@ -1,96 +1,693 @@
+#include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef uint64_t Bitboard;
+
+#define BOARD_SIZE 64
+#define BOARD_SIDE 8
+#define D8_SIZE 8
+#define FULL_D8 0xff
+#define MAX_GROUPS 16
+#define MAX_ORBITS 64
+#define MAX_SUBSETS 256
+
+typedef struct {
+  Bitboard bb;
+  int size;
+  int min_sq;
+} Orbit;
+
+typedef struct {
+  Orbit orbit[MAX_ORBITS];
+  int n;
+} OrbitList;
+
+typedef struct {
+  Bitboard subset[MAX_SUBSETS];
+  int n;
+} SubsetList;
+
+typedef struct {
+  unsigned char group_mask;
+  Bitboard occ;
+  Bitboard allow;
+  int g;
+  int r;
+  uint64_t count;
+} MemoEntry;
+
+typedef struct {
+  int n;
+  int mult[MAX_GROUPS];
+  int total;
+  MemoEntry *memo;
+  size_t memo_len;
+  size_t memo_cap;
+} Context;
+
+static int map[D8_SIZE][BOARD_SIZE];
+static int initialized;
+
+static int bitcount(Bitboard b)
+{
+  int n = 0;
+
+  while (b) {
+    b &= b - 1;
+    n++;
+  }
+  return n;
+}
+
+static int first_square(Bitboard b)
+{
+  for (int sq = 0; sq < BOARD_SIZE; sq++) {
+    if (b & ((Bitboard)1 << sq)) {
+      return sq;
+    }
+  }
+  return -1;
+}
+
+static int take_square(Bitboard *b)
+{
+  int sq = first_square(*b);
+
+  if (sq < 0) {
+    abort();
+  }
+  *b &= ~((Bitboard)1 << sq);
+  return sq;
+}
+
+static int transform_square_raw(int sq, int t)
+{
+  int r = sq / BOARD_SIDE;
+  int c = sq % BOARD_SIDE;
+  int nr = r;
+  int nc = c;
+
+  switch (t) {
+  case 0: nr = r; nc = c; break;
+  case 1: nr = c; nc = BOARD_SIDE - 1 - r; break;
+  case 2: nr = BOARD_SIDE - 1 - r; nc = BOARD_SIDE - 1 - c; break;
+  case 3: nr = BOARD_SIDE - 1 - c; nc = r; break;
+  case 4: nr = r; nc = BOARD_SIDE - 1 - c; break;
+  case 5: nr = BOARD_SIDE - 1 - r; nc = c; break;
+  case 6: nr = c; nc = r; break;
+  case 7: nr = BOARD_SIDE - 1 - c; nc = BOARD_SIDE - 1 - r; break;
+  default: abort();
+  }
+  return nr * BOARD_SIDE + nc;
+}
+
+static Bitboard transform_bb(Bitboard b, int t)
+{
+  Bitboard out = 0;
+
+  while (b) {
+    int sq = take_square(&b);
+    out |= (Bitboard)1 << map[t][sq];
+  }
+  return out;
+}
 
 void init(void)
 {
-  // precompute a set of lookup tables to be used by rank.
+  if (initialized) {
+    return;
+  }
+  for (int t = 0; t < D8_SIZE; t++) {
+    for (int sq = 0; sq < BOARD_SIZE; sq++) {
+      map[t][sq] = transform_square_raw(sq, t);
+    }
+  }
+  initialized = 1;
 }
 
-uint64_t rank_rec(int n, int mult[], int sq[], int group_id, int r, int orbit,
-    Bitboard occ)
+static void validate_mult(int n, const int mult[])
 {
-  // n is the number of elements in mult[]
-  //
-  // mult[0], mult[1], ..., mult[n-1] are multiplicities >= 1
-  //
-  // sq[] is an array of mult[0] + ... + mult[n-1] squares on a chessboard (0-63)
-  // The first mult[0] elements of sq[] correspond to one piece type
-  // The next mult[1] elements of sq[] correspond to a second piece type, etc.
-  //
-  // group_id identifies one of the 10 subgroups of D8 (including D8)
-  // - the placement of already placed pieces on the squares identified
-  //   by the occ bitboard is symmetrical under this symmetry group.
-  //
-  // r is the number of remaining pieces in the "current group being placed"
-  // as explained below. This number is not included in n or mult[].
-  //
-  // orbit is the number of the orbit under the symmetry group identified by
-  // group_id starting from which the remaining pieces may be placed (if r > 0).
-  //
-  // occ is a bitboard of the squares that have already received a piece (not
-  // included in n and mult[]).
-  //
-  // The value returned by rank is a value from 0 to N-1, where N is the
-  // total number of unique placements for mult[] pieces up to D8 symmetry of
-  // the chess board.
-  //
-  // The method used for calculating the rank is as follows:
-  // - start with the symmetry group D8 and the set of empty orbits of the
-  //   chess board under D8 (6 orbits of size 8, 4 orbits of size 4).
-  // - Order the orbits, with the largest orbits ranked before the smaller
-  //   orbits.
-  // - Find the lowest-ranking orbit that receives one or more of the mult[0]
-  //   pieces of the first group of pieces.
-  // - Consider the possible canonical ways in which to place pieces in this
-  //   lowest-ranking orbit and order these placements.
-  // - Each of these placements corresponds to a number of ways in which the
-  //   remaining pieces can be placed (a "completion number").
-  //   This number is determined by a "state" which is defined by the
-  //   following information:
-  //   - the symmetry (sub)group H of remaining symmetries (after canonicalizing
-  //     the pieces in the beforementioned lowest-ranking orbit). Note that
-  //     we may have H = D8, but usually one, more or all symmetries will break.
-  //   - the multiplicities of the types of empty orbits under H.
-  //     - Note that H-orbits that received at least one piece will have
-  //       necessarily received a piece on each of its squares.
-  //     - Although in general not all orbits under an action of a group G
-  //       having the same size will be the "same" as a G-set, in the case
-  //       of the chessboard I have verified that all H-orbits of the same
-  //       size are isomorphic as H-sets, for each of the 10 subgroups H of D8.
-  //   - the multiplicities mult[] of the remaining groups of pieces.
-  //   - the number of remaining pieces in the group of pieces currently
-  //     being placed (possibly 0).
-  //   - an indication of the first empty H-orbit that may receive further
-  //     pieces from the remaining pieces in the group of pieces currently
-  //     being placed (if >0).
-  //     - For this to work, if H is smaller than D8 (or the previous group G
-  //       of symmetries), then the smaller H-orbits must be ordered in a way
-  //       that respects the order of the D8-orbits (or G-orbits). I believe
-  //       this does not prevent us from ordering the H-orbits by descending
-  //       size in the specific case of the chessboard and the D8 subgroups.
-  // - to calculate the rank, we must sum the completion numbers for each
-  //   of the possible canonical placements preceding the current placement
-  //   (within the lowest-ranked orbit) and then recursively invoke the
-  //   rank function for the remaining pieces (passing correct state, etc.)
-  //   - potentially it could be useful to pass a bitboard with the already
-  //     placed pieces, from which multiplicities of empty H-orbits can be
-  //     arrived, but other approaches may work as well.
-  // - Make a precomputed table to speed up the calculation as much as
-  //   reasonably possible.
+  int total = 0;
+
+  if (n < 0 || n > MAX_GROUPS) {
+    fprintf(stderr, "invalid number of piece groups: %d\n", n);
+    exit(1);
+  }
+  for (int i = 0; i < n; i++) {
+    if (mult[i] < 1) {
+      fprintf(stderr, "invalid multiplicity %d for group %d\n", mult[i], i);
+      exit(1);
+    }
+    total += mult[i];
+  }
+  if (total > BOARD_SIZE) {
+    fprintf(stderr, "too many pieces: %d\n", total);
+    exit(1);
+  }
+}
+
+static Context make_context(int n, const int mult[])
+{
+  Context ctx;
+
+  init();
+  validate_mult(n, mult);
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.n = n;
+  for (int i = 0; i < n; i++) {
+    ctx.mult[i] = mult[i];
+    ctx.total += mult[i];
+  }
+  return ctx;
+}
+
+static void free_context(Context *ctx)
+{
+  free(ctx->memo);
+  memset(ctx, 0, sizeof(*ctx));
+}
+
+static int orbit_cmp(const void *a, const void *b)
+{
+  const Orbit *oa = (const Orbit *)a;
+  const Orbit *ob = (const Orbit *)b;
+
+  if (oa->size != ob->size) {
+    return ob->size - oa->size;
+  }
+  return oa->min_sq - ob->min_sq;
+}
+
+static OrbitList make_orbits(unsigned char group_mask, Bitboard occ)
+{
+  OrbitList list;
+  Bitboard unseen = ~occ;
+
+  memset(&list, 0, sizeof(list));
+  while (unseen) {
+    Bitboard orbit = 0;
+    int seed = take_square(&unseen);
+
+    for (int t = 0; t < D8_SIZE; t++) {
+      if (group_mask & (1u << t)) {
+        orbit |= (Bitboard)1 << map[t][seed];
+      }
+    }
+    unseen &= ~orbit;
+    list.orbit[list.n].bb = orbit;
+    list.orbit[list.n].size = bitcount(orbit);
+    list.orbit[list.n].min_sq = first_square(orbit);
+    list.n++;
+  }
+  qsort(list.orbit, (size_t)list.n, sizeof(list.orbit[0]), orbit_cmp);
+  return list;
+}
+
+static Bitboard canonical_bb(Bitboard bb, unsigned char group_mask)
+{
+  Bitboard best = 0;
+  int have_best = 0;
+
+  for (int t = 0; t < D8_SIZE; t++) {
+    if (group_mask & (1u << t)) {
+      Bitboard cur = transform_bb(bb, t);
+
+      if (!have_best || cur < best) {
+        best = cur;
+        have_best = 1;
+      }
+    }
+  }
+  return best;
+}
+
+static int subset_cmp(const void *a, const void *b)
+{
+  const Bitboard *sa = (const Bitboard *)a;
+  const Bitboard *sb = (const Bitboard *)b;
+
+  if (*sa < *sb) {
+    return -1;
+  }
+  if (*sa > *sb) {
+    return 1;
+  }
+  return 0;
+}
+
+static SubsetList canonical_subsets(Bitboard orbit, int max_pieces,
+    unsigned char group_mask)
+{
+  SubsetList list;
+
+  memset(&list, 0, sizeof(list));
+  for (Bitboard sub = orbit; sub; sub = (sub - 1) & orbit) {
+    if (bitcount(sub) <= max_pieces && canonical_bb(sub, group_mask) == sub) {
+      if (list.n >= MAX_SUBSETS) {
+        fprintf(stderr, "too many canonical subsets in orbit\n");
+        exit(1);
+      }
+      list.subset[list.n++] = sub;
+    }
+  }
+  qsort(list.subset, (size_t)list.n, sizeof(list.subset[0]), subset_cmp);
+  return list;
+}
+
+static unsigned char stabilizer(unsigned char group_mask, Bitboard subset)
+{
+  unsigned char out = 0;
+
+  for (int t = 0; t < D8_SIZE; t++) {
+    if ((group_mask & (1u << t)) && transform_bb(subset, t) == subset) {
+      out |= (unsigned char)(1u << t);
+    }
+  }
+  return out;
+}
+
+static Bitboard remaining_allow(Bitboard allow, const OrbitList *orbits,
+    int orbit_idx)
+{
+  Bitboard blocked = 0;
+
+  for (int i = 0; i <= orbit_idx; i++) {
+    blocked |= orbits->orbit[i].bb;
+  }
+  return allow & ~blocked;
+}
+
+static uint64_t count_state(Context *ctx, unsigned char group_mask,
+    Bitboard occ, Bitboard allow, int g, int r);
+
+static uint64_t count_after_subset(Context *ctx, unsigned char group_mask,
+    Bitboard occ, int g, int r, const OrbitList *orbits, int orbit_idx,
+    Bitboard allow,
+    Bitboard subset)
+{
+  int used = bitcount(subset);
+  unsigned char new_group = stabilizer(group_mask, subset);
+  Bitboard new_occ = occ | subset;
+  int new_r = r - used;
+  Bitboard new_allow = 0;
+
+  if (new_r > 0) {
+    (void)new_group;
+    (void)new_occ;
+    new_allow = remaining_allow(allow, orbits, orbit_idx);
+  }
+  return count_state(ctx, new_group, new_occ, new_allow, g, new_r);
+}
+
+static MemoEntry *find_memo(Context *ctx, unsigned char group_mask,
+    Bitboard occ, Bitboard allow, int g, int r)
+{
+  for (size_t i = 0; i < ctx->memo_len; i++) {
+    MemoEntry *entry = &ctx->memo[i];
+
+    if (entry->group_mask == group_mask && entry->occ == occ &&
+        entry->allow == allow && entry->g == g && entry->r == r) {
+      return entry;
+    }
+  }
+  return NULL;
+}
+
+static void add_memo(Context *ctx, unsigned char group_mask, Bitboard occ,
+    Bitboard allow, int g, int r, uint64_t count)
+{
+  MemoEntry *entry;
+
+  if (ctx->memo_len == ctx->memo_cap) {
+    size_t new_cap = ctx->memo_cap ? 2 * ctx->memo_cap : 4096;
+    MemoEntry *new_memo = realloc(ctx->memo, new_cap * sizeof(*new_memo));
+
+    if (!new_memo) {
+      fprintf(stderr, "out of memory while memoizing completion counts\n");
+      exit(1);
+    }
+    ctx->memo = new_memo;
+    ctx->memo_cap = new_cap;
+  }
+  entry = &ctx->memo[ctx->memo_len++];
+  entry->group_mask = group_mask;
+  entry->occ = occ;
+  entry->allow = allow;
+  entry->g = g;
+  entry->r = r;
+  entry->count = count;
+}
+
+static uint64_t count_state(Context *ctx, unsigned char group_mask,
+    Bitboard occ, Bitboard allow, int g, int r)
+{
+  OrbitList orbits;
+  uint64_t total = 0;
+  MemoEntry *memo;
+
+  if (r == 0) {
+    g++;
+    if (g == ctx->n) {
+      return 1;
+    }
+    r = ctx->mult[g];
+    allow = ~occ;
+  }
+
+  memo = find_memo(ctx, group_mask, occ, allow, g, r);
+  if (memo) {
+    return memo->count;
+  }
+
+  orbits = make_orbits(group_mask, occ);
+  for (int i = 0; i < orbits.n; i++) {
+    SubsetList subsets = canonical_subsets(orbits.orbit[i].bb, r, group_mask);
+
+    if (orbits.orbit[i].bb & ~allow) {
+      continue;
+    }
+    for (int j = 0; j < subsets.n; j++) {
+      total += count_after_subset(ctx, group_mask, occ, g, r, &orbits, i,
+          allow, subsets.subset[j]);
+    }
+  }
+
+  add_memo(ctx, group_mask, occ, allow, g, r, total);
+  return total;
+}
+
+static int fill_groups_from_squares(int n, const int mult[], const int sq[],
+    Bitboard group[])
+{
+  Bitboard occ = 0;
+  int off = 0;
+
+  for (int g = 0; g < n; g++) {
+    group[g] = 0;
+    for (int i = 0; i < mult[g]; i++) {
+      int s = sq[off++];
+      Bitboard bit;
+
+      if (s < 0 || s >= BOARD_SIZE) {
+        return 0;
+      }
+      bit = (Bitboard)1 << s;
+      if (occ & bit) {
+        return 0;
+      }
+      occ |= bit;
+      group[g] |= bit;
+    }
+  }
+  return 1;
+}
+
+static uint64_t rank_state(Context *ctx, const Bitboard target[],
+    unsigned char group_mask, Bitboard occ, Bitboard allow, int g, int r,
+    int *valid)
+{
+  OrbitList orbits;
+  int actual_orbit = -1;
+  Bitboard actual_subset = 0;
+  uint64_t rank = 0;
+
+  if (r == 0) {
+    g++;
+    if (g == ctx->n) {
+      return 0;
+    }
+    r = ctx->mult[g];
+    allow = ~occ;
+  }
+
+  orbits = make_orbits(group_mask, occ);
+
+  for (int i = 0; i < orbits.n; i++) {
+    if ((orbits.orbit[i].bb & ~allow) && (target[g] & orbits.orbit[i].bb)) {
+      *valid = 0;
+      return 0;
+    }
+  }
+
+  for (int i = 0; i < orbits.n; i++) {
+    Bitboard here = target[g] & orbits.orbit[i].bb;
+
+    if (orbits.orbit[i].bb & ~allow) {
+      continue;
+    }
+    if (here) {
+      actual_orbit = i;
+      actual_subset = here;
+      break;
+    }
+  }
+  if (actual_orbit < 0 || bitcount(actual_subset) > r) {
+    *valid = 0;
+    return 0;
+  }
+
+  for (int i = 0; i <= actual_orbit; i++) {
+    SubsetList subsets = canonical_subsets(orbits.orbit[i].bb, r, group_mask);
+
+    if (orbits.orbit[i].bb & ~allow) {
+      continue;
+    }
+    for (int j = 0; j < subsets.n; j++) {
+      if (i == actual_orbit && subsets.subset[j] == actual_subset) {
+        rank += rank_state(ctx, target, stabilizer(group_mask, actual_subset),
+            occ | actual_subset,
+            r - bitcount(actual_subset) > 0
+                ? remaining_allow(allow, &orbits, actual_orbit)
+                : 0,
+            g, r - bitcount(actual_subset),
+            valid);
+        return rank;
+      }
+      if (i < actual_orbit ||
+          (i == actual_orbit && subsets.subset[j] < actual_subset)) {
+        rank += count_after_subset(ctx, group_mask, occ, g, r, &orbits, i,
+            allow, subsets.subset[j]);
+      }
+    }
+  }
+
+  *valid = 0;
+  return 0;
 }
 
 uint64_t rank(int n, int mult[], int sq[])
 {
-  return rank_rec(n, mult, sq, 0, 0, 0);
+  Context ctx = make_context(n, mult);
+  Bitboard group[MAX_GROUPS];
+  uint64_t best_rank = 0;
+  int have_rank = 0;
+
+  if (!fill_groups_from_squares(n, mult, sq, group)) {
+    fprintf(stderr, "invalid placement passed to rank\n");
+    exit(1);
+  }
+
+  if (n == 0) {
+    free_context(&ctx);
+    return 0;
+  }
+
+  for (int t = 0; t < D8_SIZE; t++) {
+    Bitboard transformed[MAX_GROUPS];
+    int valid = 1;
+    uint64_t rank;
+
+    for (int g = 0; g < n; g++) {
+      transformed[g] = transform_bb(group[g], t);
+    }
+    rank = rank_state(&ctx, transformed, FULL_D8, 0, ~(Bitboard)0, 0, mult[0],
+        &valid);
+    if (valid && (!have_rank || rank < best_rank)) {
+      best_rank = rank;
+      have_rank = 1;
+    }
+  }
+
+  if (!have_rank) {
+    fprintf(stderr, "internal error: placement is not recursively canonical\n");
+    exit(1);
+  }
+
+  free_context(&ctx);
+  return best_rank;
 }
 
-Bitboard unrank(int n, int mult[], int rk, int out[])
+uint64_t count_unique_positions(int n, int mult[])
 {
-  // unrank() function corresponding to rank()
+  Context ctx = make_context(n, mult);
+  uint64_t count = n == 0 ? 1 : count_state(&ctx, FULL_D8, 0, ~(Bitboard)0, 0,
+      mult[0]);
+
+  free_context(&ctx);
+  return count;
+}
+
+static void unrank_state(Context *ctx, uint64_t *rk, Bitboard group[],
+    unsigned char group_mask, Bitboard occ, Bitboard allow, int g, int r)
+{
+  OrbitList orbits;
+
+  if (r == 0) {
+    g++;
+    if (g == ctx->n) {
+      return;
+    }
+    r = ctx->mult[g];
+    allow = ~occ;
+  }
+
+  orbits = make_orbits(group_mask, occ);
+  for (int i = 0; i < orbits.n; i++) {
+    SubsetList subsets = canonical_subsets(orbits.orbit[i].bb, r, group_mask);
+
+    if (orbits.orbit[i].bb & ~allow) {
+      continue;
+    }
+    for (int j = 0; j < subsets.n; j++) {
+      uint64_t count = count_after_subset(ctx, group_mask, occ, g, r, &orbits,
+          i, allow, subsets.subset[j]);
+
+      if (*rk >= count) {
+        *rk -= count;
+        continue;
+      }
+
+      group[g] |= subsets.subset[j];
+      unrank_state(ctx, rk, group, stabilizer(group_mask, subsets.subset[j]),
+          occ | subsets.subset[j],
+          r - bitcount(subsets.subset[j]) > 0
+              ? remaining_allow(allow, &orbits, i)
+              : 0,
+          g, r - bitcount(subsets.subset[j]));
+      return;
+    }
+  }
+
+  fprintf(stderr, "internal error: rank not consumed during unrank\n");
+  exit(1);
+}
+
+Bitboard unrank(int n, int mult[], uint64_t rk, int out[])
+{
+  Context ctx = make_context(n, mult);
+  uint64_t count = n == 0 ? 1 : count_state(&ctx, FULL_D8, 0, ~(Bitboard)0, 0,
+      mult[0]);
+  Bitboard group[MAX_GROUPS] = { 0 };
+  Bitboard occ = 0;
+  int off = 0;
+
+  if (rk >= count) {
+    fprintf(stderr, "rank %" PRIu64 " is out of range; maximum is %" PRIu64
+        "\n", rk, count ? count - 1 : 0);
+    exit(1);
+  }
+
+  if (n > 0) {
+    unrank_state(&ctx, &rk, group, FULL_D8, 0, ~(Bitboard)0, 0, mult[0]);
+  }
+
+  for (int g = 0; g < n; g++) {
+    Bitboard b = group[g];
+
+    while (b) {
+      int sq = take_square(&b);
+      out[off++] = sq;
+      occ |= (Bitboard)1 << sq;
+    }
+  }
+
+  free_context(&ctx);
+  return occ;
+}
+
+static void print_position(int n, const int mult[], const int sq[])
+{
+  int off = 0;
+
+  printf("[");
+  for (int g = 0; g < n; g++) {
+    printf("%s{", g ? ", " : "");
+    for (int i = 0; i < mult[g]; i++) {
+      printf("%s%d", i ? ", " : "", sq[off++]);
+    }
+    printf("}");
+  }
+  printf("]");
+}
+
+static int test_case(int n, int mult[], int sq[])
+{
+  int total = 0;
+  uint64_t count;
+  uint64_t rk;
+  int out[BOARD_SIZE];
+  uint64_t rk2;
+
+  for (int i = 0; i < n; i++) {
+    total += mult[i];
+  }
+
+  count = count_unique_positions(n, mult);
+  rk = rank(n, mult, sq);
+  (void)unrank(n, mult, rk, out);
+  rk2 = rank(n, mult, out);
+
+  print_position(n, mult, sq);
+  printf(" -> %" PRIu64 " unique positions, rank %" PRIu64 " -> ", count, rk);
+  print_position(n, mult, out);
+  printf("\n");
+
+  if (rk >= count || rk != rk2) {
+    fprintf(stderr, "round trip failed: rank=%" PRIu64 ", rank2=%" PRIu64
+        ", count=%" PRIu64 "\n", rk, rk2, count);
+    return 0;
+  }
+
+  for (int i = 0; i < total; i++) {
+    if (out[i] < 0 || out[i] >= BOARD_SIZE) {
+      return 0;
+    }
+  }
+  return 1;
 }
 
 int main(int argc, char *argv[])
 {
+  int ok = 1;
+
+  (void)argc;
+  (void)argv;
+
   init();
 
-  // Test rank() and unrank() on some positions.
+  {
+    int mult[] = { 1 };
+    int sq[] = { 0 };
+    ok &= test_case(1, mult, sq);
+  }
+  {
+    int mult[] = { 2 };
+    int sq[] = { 0, 63 };
+    ok &= test_case(1, mult, sq);
+  }
+  {
+    int mult[] = { 1, 1 };
+    int sq[] = { 0, 9 };
+    ok &= test_case(2, mult, sq);
+  }
+  {
+    int mult[] = { 2, 1 };
+    int sq[] = { 0, 7, 28 };
+    ok &= test_case(2, mult, sq);
+  }
+
+  return ok ? 0 : 1;
 }
