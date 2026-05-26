@@ -14,6 +14,7 @@ typedef uint64_t Bitboard;
 #define MAX_ORBITS 64
 #define MAX_SUBSETS 256
 #define SUBGROUP_COUNT 10
+#define MAX_PIECES 8
 
 typedef struct {
   Bitboard bb;
@@ -35,20 +36,16 @@ typedef struct {
 
 typedef struct {
   unsigned char group_mask;
+  uint32_t rem_sig;
   unsigned char empty_by_size[BOARD_SIDE + 1];
   unsigned char allow_by_size[BOARD_SIDE + 1];
-  int g;
-  int r;
   uint64_t count;
-} MemoEntry;
+} CountEntry;
 
 typedef struct {
   int n;
   int mult[MAX_GROUPS];
   int total;
-  MemoEntry *memo;
-  size_t memo_len;
-  size_t memo_cap;
 } Context;
 
 static int map[D8_SIZE][BOARD_SIZE];
@@ -66,6 +63,13 @@ static const unsigned char subgroup_mask[SUBGROUP_COUNT] = {
 };
 static OrbitList subgroup_orbits[SUBGROUP_COUNT];
 static SubsetList subset_cache[SUBGROUP_COUNT][MAX_ORBITS][BOARD_SIDE + 1];
+static unsigned char orbit_idx_by_size[SUBGROUP_COUNT][BOARD_SIDE + 1];
+static unsigned char decomp_by_size[SUBGROUP_COUNT][SUBGROUP_COUNT]
+    [BOARD_SIDE + 1][BOARD_SIDE + 1];
+static CountEntry *count_table;
+static size_t count_table_len;
+static size_t count_table_cap;
+static int prebuilding_counts;
 static int initialized;
 
 static int bitcount(Bitboard b)
@@ -156,6 +160,7 @@ static int subgroup_index(unsigned char group_mask)
 }
 
 static Bitboard canonical_bb(Bitboard bb, unsigned char group_mask);
+static void build_completion_tables(void);
 
 static OrbitList build_empty_orbits(unsigned char group_mask)
 {
@@ -183,6 +188,52 @@ static OrbitList build_empty_orbits(unsigned char group_mask)
     list.orbit[i].cache_idx = i;
   }
   return list;
+}
+
+static void count_suborbits(Bitboard set, int subgroup, unsigned char out[])
+{
+  memset(out, 0, BOARD_SIDE + 1);
+  for (int i = 0; i < subgroup_orbits[subgroup].n; i++) {
+    const Orbit *orbit = &subgroup_orbits[subgroup].orbit[i];
+
+    if ((orbit->bb & set) == orbit->bb) {
+      out[orbit->size]++;
+    } else if (orbit->bb & set) {
+      fprintf(stderr, "internal error: set splits a subgroup orbit\n");
+      exit(1);
+    }
+  }
+}
+
+static void build_decomposition_tables(void)
+{
+  for (int h = 0; h < SUBGROUP_COUNT; h++) {
+    memset(orbit_idx_by_size[h], 0xff, sizeof(orbit_idx_by_size[h]));
+    for (int i = 0; i < subgroup_orbits[h].n; i++) {
+      int size = subgroup_orbits[h].orbit[i].size;
+
+      if (orbit_idx_by_size[h][size] == 0xff) {
+        orbit_idx_by_size[h][size] = (unsigned char)i;
+      }
+    }
+  }
+
+  memset(decomp_by_size, 0, sizeof(decomp_by_size));
+  for (int h = 0; h < SUBGROUP_COUNT; h++) {
+    for (int k = 0; k < SUBGROUP_COUNT; k++) {
+      if ((subgroup_mask[k] & subgroup_mask[h]) != subgroup_mask[k]) {
+        continue;
+      }
+      for (int size = 1; size <= BOARD_SIDE; size++) {
+        int idx = orbit_idx_by_size[h][size];
+
+        if (idx != 0xff) {
+          count_suborbits(subgroup_orbits[h].orbit[idx].bb, k,
+              decomp_by_size[h][k][size]);
+        }
+      }
+    }
+  }
 }
 
 static unsigned char stabilizer(unsigned char group_mask, Bitboard subset);
@@ -229,6 +280,7 @@ void init(void)
   for (int i = 0; i < SUBGROUP_COUNT; i++) {
     subgroup_orbits[i] = build_empty_orbits(subgroup_mask[i]);
   }
+  build_decomposition_tables();
   for (int s = 0; s < SUBGROUP_COUNT; s++) {
     for (int o = 0; o < subgroup_orbits[s].n; o++) {
       for (int max_pieces = 0; max_pieces <= BOARD_SIDE; max_pieces++) {
@@ -237,6 +289,7 @@ void init(void)
       }
     }
   }
+  build_completion_tables();
   initialized = 1;
 }
 
@@ -255,7 +308,7 @@ static void validate_mult(int n, const int mult[])
     }
     total += mult[i];
   }
-  if (total > BOARD_SIZE) {
+  if (total > MAX_PIECES) {
     fprintf(stderr, "too many pieces: %d\n", total);
     exit(1);
   }
@@ -278,7 +331,6 @@ static Context make_context(int n, const int mult[])
 
 static void free_context(Context *ctx)
 {
-  free(ctx->memo);
   memset(ctx, 0, sizeof(*ctx));
 }
 
@@ -390,6 +442,10 @@ static Bitboard remaining_allow(Bitboard allow, const OrbitList *orbits,
 static uint64_t count_state(Context *ctx, unsigned char group_mask,
     Bitboard occ, Bitboard allow, int g, int r);
 
+static uint64_t count_compact(unsigned char group_mask,
+    const unsigned char empty_by_size[],
+    const unsigned char allow_by_size[], uint32_t rem_sig);
+
 static uint64_t count_after_subset(Context *ctx, Bitboard occ, int g, int r,
     const OrbitList *orbits, int orbit_idx, Bitboard allow, Bitboard subset,
     unsigned char subset_stabilizer)
@@ -425,46 +481,235 @@ static void make_memo_counts(const OrbitList *orbits, Bitboard allow,
   }
 }
 
-static MemoEntry *find_memo(Context *ctx, unsigned char group_mask,
-    const unsigned char empty_by_size[], const unsigned char allow_by_size[],
-    int g, int r)
+static uint32_t make_rem_sig_from_context(const Context *ctx, int g, int r)
 {
-  for (size_t i = 0; i < ctx->memo_len; i++) {
-    MemoEntry *entry = &ctx->memo[i];
+  uint32_t sig;
+  int len;
 
-    if (entry->group_mask == group_mask && entry->g == g && entry->r == r &&
+  if (r == 0) {
+    g++;
+    if (g == ctx->n) {
+      return 0;
+    }
+    r = ctx->mult[g];
+  }
+
+  len = ctx->n - g;
+  sig = (uint32_t)len;
+  sig |= (uint32_t)r << 4;
+  for (int i = 1; i < len; i++) {
+    sig |= (uint32_t)ctx->mult[g + i] << (4 * (i + 1));
+  }
+  return sig;
+}
+
+static int rem_len(uint32_t sig)
+{
+  return (int)(sig & 0xf);
+}
+
+static int rem_at(uint32_t sig, int idx)
+{
+  return (int)((sig >> (4 * (idx + 1))) & 0xf);
+}
+
+static uint32_t rem_after_use(uint32_t sig, int used)
+{
+  int len = rem_len(sig);
+  int r = rem_at(sig, 0) - used;
+  uint32_t out;
+
+  if (r > 0) {
+    out = (sig & ~((uint32_t)0xf << 4)) | ((uint32_t)r << 4);
+    return out;
+  }
+
+  out = (uint32_t)(len - 1);
+  for (int i = 1; i < len; i++) {
+    out |= (uint32_t)rem_at(sig, i) << (4 * i);
+  }
+  return out;
+}
+
+static CountEntry *find_count_entry(unsigned char group_mask, uint32_t rem_sig,
+    const unsigned char empty_by_size[], const unsigned char allow_by_size[],
+    int *found)
+{
+  *found = 0;
+  for (size_t i = 0; i < count_table_len; i++) {
+    CountEntry *entry = &count_table[i];
+
+    if (entry->group_mask == group_mask && entry->rem_sig == rem_sig &&
         memcmp(entry->empty_by_size, empty_by_size, BOARD_SIDE + 1) == 0 &&
         memcmp(entry->allow_by_size, allow_by_size, BOARD_SIDE + 1) == 0) {
+      *found = 1;
       return entry;
     }
   }
-  return NULL;
-}
+  if (count_table_len == count_table_cap) {
+    size_t new_cap = count_table_cap ? 2 * count_table_cap : 65536;
+    CountEntry *new_table = realloc(count_table, new_cap * sizeof(*new_table));
 
-static void add_memo(Context *ctx, unsigned char group_mask,
-    const unsigned char empty_by_size[], const unsigned char allow_by_size[],
-    int g, int r, uint64_t count)
-{
-  MemoEntry *entry;
-
-  if (ctx->memo_len == ctx->memo_cap) {
-    size_t new_cap = ctx->memo_cap ? 2 * ctx->memo_cap : 4096;
-    MemoEntry *new_memo = realloc(ctx->memo, new_cap * sizeof(*new_memo));
-
-    if (!new_memo) {
-      fprintf(stderr, "out of memory while memoizing completion counts\n");
+    if (!new_table) {
+      fprintf(stderr, "out of memory while building completion table\n");
       exit(1);
     }
-    ctx->memo = new_memo;
-    ctx->memo_cap = new_cap;
+    count_table = new_table;
+    count_table_cap = new_cap;
   }
-  entry = &ctx->memo[ctx->memo_len++];
+  CountEntry *entry = &count_table[count_table_len++];
   entry->group_mask = group_mask;
+  entry->rem_sig = rem_sig;
   memcpy(entry->empty_by_size, empty_by_size, BOARD_SIDE + 1);
   memcpy(entry->allow_by_size, allow_by_size, BOARD_SIDE + 1);
-  entry->g = g;
-  entry->r = r;
-  entry->count = count;
+  entry->count = UINT64_MAX;
+  return entry;
+}
+
+static void decompose_counts(int h, int k, const unsigned char old_counts[],
+    unsigned char new_counts[])
+{
+  memset(new_counts, 0, BOARD_SIDE + 1);
+  for (int old_size = 1; old_size <= BOARD_SIDE; old_size++) {
+    for (int new_size = 1; new_size <= BOARD_SIDE; new_size++) {
+      new_counts[new_size] += (unsigned char)(old_counts[old_size] *
+          decomp_by_size[h][k][old_size][new_size]);
+    }
+  }
+}
+
+static uint64_t count_compact(unsigned char group_mask,
+    const unsigned char empty_by_size[],
+    const unsigned char allow_by_size[], uint32_t rem_sig)
+{
+  int found;
+  CountEntry *entry;
+  int h;
+  int r;
+  uint64_t total = 0;
+
+  if (rem_len(rem_sig) == 0) {
+    return 1;
+  }
+
+  entry = find_count_entry(group_mask, rem_sig, empty_by_size, allow_by_size,
+      &found);
+  if (found) {
+    if (entry->count == UINT64_MAX) {
+      fprintf(stderr, "internal error: recursive completion-count cycle\n");
+      exit(1);
+    }
+    return entry->count;
+  }
+  if (!prebuilding_counts) {
+    fprintf(stderr, "internal error: completion table miss\n");
+    exit(1);
+  }
+
+  h = subgroup_index(group_mask);
+  r = rem_at(rem_sig, 0);
+
+  for (int size = BOARD_SIDE; size >= 1; size--) {
+    int orbit_idx;
+    const SubsetList *subsets;
+
+    if (allow_by_size[size] == 0) {
+      continue;
+    }
+    orbit_idx = orbit_idx_by_size[h][size];
+    if (orbit_idx == 0xff) {
+      continue;
+    }
+    subsets = canonical_subsets(group_mask,
+        &subgroup_orbits[h].orbit[orbit_idx], r);
+
+    for (int pos = 1; pos <= allow_by_size[size]; pos++) {
+      for (int j = 0; j < subsets->n; j++) {
+        unsigned char new_empty[BOARD_SIDE + 1];
+        unsigned char new_allow[BOARD_SIDE + 1];
+        unsigned char occupied[BOARD_SIDE + 1];
+        unsigned char remaining_allow[BOARD_SIDE + 1];
+        int used = bitcount(subsets->subset[j]);
+        uint32_t new_sig = rem_after_use(rem_sig, used);
+        int k = subgroup_index(subsets->stabilizer[j]);
+
+        decompose_counts(h, k, empty_by_size, new_empty);
+        count_suborbits(subsets->subset[j], k, occupied);
+        for (int s = 1; s <= BOARD_SIDE; s++) {
+          new_empty[s] -= occupied[s];
+        }
+
+        if (used < r) {
+          memset(remaining_allow, 0, sizeof(remaining_allow));
+          for (int s = 1; s <= BOARD_SIDE; s++) {
+            if (s < size) {
+              remaining_allow[s] = allow_by_size[s];
+            } else if (s == size) {
+              remaining_allow[s] = (unsigned char)(allow_by_size[s] - pos);
+            }
+          }
+          decompose_counts(h, k, remaining_allow, new_allow);
+        } else {
+          memcpy(new_allow, new_empty, sizeof(new_allow));
+        }
+
+        total += count_compact(subsets->stabilizer[j], new_empty, new_allow,
+            new_sig);
+      }
+    }
+  }
+
+  entry->count = total;
+  return total;
+}
+
+static uint32_t pack_parts(const int parts[], int len)
+{
+  uint32_t sig = (uint32_t)len;
+
+  for (int i = 0; i < len; i++) {
+    sig |= (uint32_t)parts[i] << (4 * (i + 1));
+  }
+  return sig;
+}
+
+static void build_completion_for_parts(const int parts[], int len)
+{
+  unsigned char empty_by_size[BOARD_SIDE + 1];
+  unsigned char allow_by_size[BOARD_SIDE + 1];
+  int full = subgroup_index(FULL_D8);
+
+  memset(empty_by_size, 0, sizeof(empty_by_size));
+  for (int i = 0; i < subgroup_orbits[full].n; i++) {
+    empty_by_size[subgroup_orbits[full].orbit[i].size]++;
+  }
+  memcpy(allow_by_size, empty_by_size, sizeof(allow_by_size));
+  (void)count_compact(FULL_D8, empty_by_size, allow_by_size,
+      pack_parts(parts, len));
+}
+
+static void gen_compositions(int remaining, int parts[], int len)
+{
+  if (remaining == 0) {
+    build_completion_for_parts(parts, len);
+    return;
+  }
+
+  for (int p = 1; p <= remaining; p++) {
+    parts[len] = p;
+    gen_compositions(remaining - p, parts, len + 1);
+  }
+}
+
+static void build_completion_tables(void)
+{
+  int parts[MAX_PIECES];
+
+  prebuilding_counts = 1;
+  for (int total = 1; total <= MAX_PIECES; total++) {
+    gen_compositions(total, parts, 0);
+  }
+  prebuilding_counts = 0;
 }
 
 static uint64_t count_state(Context *ctx, unsigned char group_mask,
@@ -473,8 +718,7 @@ static uint64_t count_state(Context *ctx, unsigned char group_mask,
   OrbitList orbits;
   unsigned char empty_by_size[BOARD_SIDE + 1];
   unsigned char allow_by_size[BOARD_SIDE + 1];
-  uint64_t total = 0;
-  MemoEntry *memo;
+  uint32_t rem_sig;
 
   if (r == 0) {
     g++;
@@ -487,27 +731,8 @@ static uint64_t count_state(Context *ctx, unsigned char group_mask,
 
   orbits = make_orbits(group_mask, occ);
   make_memo_counts(&orbits, allow, empty_by_size, allow_by_size);
-
-  memo = find_memo(ctx, group_mask, empty_by_size, allow_by_size, g, r);
-  if (memo) {
-    return memo->count;
-  }
-
-  for (int i = 0; i < orbits.n; i++) {
-    const SubsetList *subsets = canonical_subsets(group_mask,
-        &orbits.orbit[i], r);
-
-    if (orbits.orbit[i].bb & ~allow) {
-      continue;
-    }
-    for (int j = 0; j < subsets->n; j++) {
-      total += count_after_subset(ctx, occ, g, r, &orbits, i, allow,
-          subsets->subset[j], subsets->stabilizer[j]);
-    }
-  }
-
-  add_memo(ctx, group_mask, empty_by_size, allow_by_size, g, r, total);
-  return total;
+  rem_sig = make_rem_sig_from_context(ctx, g, r);
+  return count_compact(group_mask, empty_by_size, allow_by_size, rem_sig);
 }
 
 static int fill_groups_from_squares(int n, const int mult[], const int sq[],
