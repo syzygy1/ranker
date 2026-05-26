@@ -35,8 +35,8 @@ typedef struct {
 
 typedef struct {
   unsigned char group_mask;
-  Bitboard occ;
-  Bitboard allow;
+  unsigned char empty_by_size[BOARD_SIDE + 1];
+  unsigned char allow_by_size[BOARD_SIDE + 1];
   int g;
   int r;
   uint64_t count;
@@ -401,29 +401,49 @@ static uint64_t count_after_subset(Context *ctx, Bitboard occ, int g, int r,
   Bitboard new_allow = 0;
 
   if (new_r > 0) {
-    (void)new_group;
-    (void)new_occ;
     new_allow = remaining_allow(allow, orbits, orbit_idx);
   }
   return count_state(ctx, new_group, new_occ, new_allow, g, new_r);
 }
 
+static void make_memo_counts(const OrbitList *orbits, Bitboard allow,
+    unsigned char empty_by_size[], unsigned char allow_by_size[])
+{
+  memset(empty_by_size, 0, BOARD_SIDE + 1);
+  memset(allow_by_size, 0, BOARD_SIDE + 1);
+
+  for (int i = 0; i < orbits->n; i++) {
+    const Orbit *orbit = &orbits->orbit[i];
+
+    empty_by_size[orbit->size]++;
+    if ((orbit->bb & ~allow) == 0) {
+      allow_by_size[orbit->size]++;
+    } else if (orbit->bb & allow) {
+      fprintf(stderr, "internal error: allow mask splits a subgroup orbit\n");
+      exit(1);
+    }
+  }
+}
+
 static MemoEntry *find_memo(Context *ctx, unsigned char group_mask,
-    Bitboard occ, Bitboard allow, int g, int r)
+    const unsigned char empty_by_size[], const unsigned char allow_by_size[],
+    int g, int r)
 {
   for (size_t i = 0; i < ctx->memo_len; i++) {
     MemoEntry *entry = &ctx->memo[i];
 
-    if (entry->group_mask == group_mask && entry->occ == occ &&
-        entry->allow == allow && entry->g == g && entry->r == r) {
+    if (entry->group_mask == group_mask && entry->g == g && entry->r == r &&
+        memcmp(entry->empty_by_size, empty_by_size, BOARD_SIDE + 1) == 0 &&
+        memcmp(entry->allow_by_size, allow_by_size, BOARD_SIDE + 1) == 0) {
       return entry;
     }
   }
   return NULL;
 }
 
-static void add_memo(Context *ctx, unsigned char group_mask, Bitboard occ,
-    Bitboard allow, int g, int r, uint64_t count)
+static void add_memo(Context *ctx, unsigned char group_mask,
+    const unsigned char empty_by_size[], const unsigned char allow_by_size[],
+    int g, int r, uint64_t count)
 {
   MemoEntry *entry;
 
@@ -440,8 +460,8 @@ static void add_memo(Context *ctx, unsigned char group_mask, Bitboard occ,
   }
   entry = &ctx->memo[ctx->memo_len++];
   entry->group_mask = group_mask;
-  entry->occ = occ;
-  entry->allow = allow;
+  memcpy(entry->empty_by_size, empty_by_size, BOARD_SIDE + 1);
+  memcpy(entry->allow_by_size, allow_by_size, BOARD_SIDE + 1);
   entry->g = g;
   entry->r = r;
   entry->count = count;
@@ -451,6 +471,8 @@ static uint64_t count_state(Context *ctx, unsigned char group_mask,
     Bitboard occ, Bitboard allow, int g, int r)
 {
   OrbitList orbits;
+  unsigned char empty_by_size[BOARD_SIDE + 1];
+  unsigned char allow_by_size[BOARD_SIDE + 1];
   uint64_t total = 0;
   MemoEntry *memo;
 
@@ -463,12 +485,14 @@ static uint64_t count_state(Context *ctx, unsigned char group_mask,
     allow = ~occ;
   }
 
-  memo = find_memo(ctx, group_mask, occ, allow, g, r);
+  orbits = make_orbits(group_mask, occ);
+  make_memo_counts(&orbits, allow, empty_by_size, allow_by_size);
+
+  memo = find_memo(ctx, group_mask, empty_by_size, allow_by_size, g, r);
   if (memo) {
     return memo->count;
   }
 
-  orbits = make_orbits(group_mask, occ);
   for (int i = 0; i < orbits.n; i++) {
     const SubsetList *subsets = canonical_subsets(group_mask,
         &orbits.orbit[i], r);
@@ -482,7 +506,7 @@ static uint64_t count_state(Context *ctx, unsigned char group_mask,
     }
   }
 
-  add_memo(ctx, group_mask, occ, allow, g, r, total);
+  add_memo(ctx, group_mask, empty_by_size, allow_by_size, g, r, total);
   return total;
 }
 
