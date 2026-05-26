@@ -144,15 +144,48 @@ static int transform_square_raw(int sq, int t)
   return nr * BOARD_SIDE + nc;
 }
 
+static Bitboard flip_vertical(Bitboard b)
+{
+  b = ((b >> 1) & UINT64_C(0x5555555555555555)) |
+      ((b & UINT64_C(0x5555555555555555)) << 1);
+  b = ((b >> 2) & UINT64_C(0x3333333333333333)) |
+      ((b & UINT64_C(0x3333333333333333)) << 2);
+  b = ((b >> 4) & UINT64_C(0x0f0f0f0f0f0f0f0f)) |
+      ((b & UINT64_C(0x0f0f0f0f0f0f0f0f)) << 4);
+  return b;
+}
+
+static Bitboard flip_horizontal(Bitboard b)
+{
+  return __builtin_bswap64(b);
+}
+
+static Bitboard flip_main_diagonal(Bitboard b)
+{
+  Bitboard t;
+
+  t = UINT64_C(0x0f0f0f0f00000000) & (b ^ (b << 28));
+  b ^= t ^ (t >> 28);
+  t = UINT64_C(0x3333000033330000) & (b ^ (b << 14));
+  b ^= t ^ (t >> 14);
+  t = UINT64_C(0x5500550055005500) & (b ^ (b << 7));
+  b ^= t ^ (t >> 7);
+  return b;
+}
+
 static Bitboard transform_bb(Bitboard b, int t)
 {
-  Bitboard out = 0;
-
-  while (b) {
-    int sq = take_square(&b);
-    out |= (Bitboard)1 << map[t][sq];
+  switch (t) {
+  case 0: return b;
+  case 1: return flip_vertical(flip_main_diagonal(b));
+  case 2: return flip_vertical(flip_horizontal(b));
+  case 3: return flip_horizontal(flip_main_diagonal(b));
+  case 4: return flip_vertical(b);
+  case 5: return flip_horizontal(b);
+  case 6: return flip_main_diagonal(b);
+  case 7: return flip_vertical(flip_horizontal(flip_main_diagonal(b)));
+  default: abort();
   }
-  return out;
 }
 
 static int orbit_cmp(const void *a, const void *b)
