@@ -29,10 +29,15 @@ typedef struct {
 } OrbitList;
 
 typedef struct {
+  uint32_t offset;
+  unsigned short n;
+} SubsetList;
+
+typedef struct {
   Bitboard subset[MAX_SUBSETS];
   unsigned char stabilizer[MAX_SUBSETS];
   int n;
-} SubsetList;
+} SubsetBuildList;
 
 typedef struct {
   unsigned char group_mask;
@@ -63,6 +68,10 @@ static const unsigned char subgroup_mask[SUBGROUP_COUNT] = {
 };
 static OrbitList subgroup_orbits[SUBGROUP_COUNT];
 static SubsetList subset_cache[SUBGROUP_COUNT][MAX_ORBITS][BOARD_SIDE + 1];
+static Bitboard *subset_pool;
+static unsigned char *subset_stabilizer_pool;
+static size_t subset_pool_len;
+static size_t subset_pool_cap;
 static unsigned char orbit_idx_by_size[SUBGROUP_COUNT][BOARD_SIDE + 1];
 static unsigned char decomp_by_size[SUBGROUP_COUNT][SUBGROUP_COUNT]
     [BOARD_SIDE + 1][BOARD_SIDE + 1];
@@ -238,33 +247,78 @@ static void build_decomposition_tables(void)
 
 static unsigned char stabilizer(unsigned char group_mask, Bitboard subset);
 
+static void reserve_subset_pool(size_t n)
+{
+  if (subset_pool_len + n > subset_pool_cap) {
+    size_t new_cap = subset_pool_cap ? 2 * subset_pool_cap : 4096;
+    Bitboard *new_subset;
+    unsigned char *new_stabilizer;
+
+    while (new_cap < subset_pool_len + n) {
+      new_cap *= 2;
+    }
+    new_subset = realloc(subset_pool, new_cap * sizeof(*new_subset));
+    new_stabilizer = realloc(subset_stabilizer_pool,
+        new_cap * sizeof(*new_stabilizer));
+    if (!new_subset || !new_stabilizer) {
+      fprintf(stderr, "out of memory while building subset table\n");
+      free(new_subset);
+      free(new_stabilizer);
+      exit(1);
+    }
+    subset_pool = new_subset;
+    subset_stabilizer_pool = new_stabilizer;
+    subset_pool_cap = new_cap;
+  }
+}
+
 static SubsetList build_canonical_subsets(Bitboard orbit, int max_pieces,
     unsigned char group_mask)
 {
+  SubsetBuildList build;
   SubsetList list;
 
-  memset(&list, 0, sizeof(list));
+  memset(&build, 0, sizeof(build));
   for (Bitboard sub = orbit; sub; sub = (sub - 1) & orbit) {
     if (bitcount(sub) <= max_pieces && canonical_bb(sub, group_mask) == sub) {
       unsigned char sub_stabilizer;
       int j;
 
-      if (list.n >= MAX_SUBSETS) {
+      if (build.n >= MAX_SUBSETS) {
         fprintf(stderr, "too many canonical subsets in orbit\n");
         exit(1);
       }
       sub_stabilizer = stabilizer(group_mask, sub);
-      j = list.n++;
-      while (j > 0 && list.subset[j - 1] > sub) {
-        list.subset[j] = list.subset[j - 1];
-        list.stabilizer[j] = list.stabilizer[j - 1];
+      j = build.n++;
+      while (j > 0 && build.subset[j - 1] > sub) {
+        build.subset[j] = build.subset[j - 1];
+        build.stabilizer[j] = build.stabilizer[j - 1];
         j--;
       }
-      list.subset[j] = sub;
-      list.stabilizer[j] = sub_stabilizer;
+      build.subset[j] = sub;
+      build.stabilizer[j] = sub_stabilizer;
     }
   }
+
+  reserve_subset_pool((size_t)build.n);
+  list.offset = (uint32_t)subset_pool_len;
+  list.n = (unsigned short)build.n;
+  for (int i = 0; i < build.n; i++) {
+    subset_pool[subset_pool_len] = build.subset[i];
+    subset_stabilizer_pool[subset_pool_len] = build.stabilizer[i];
+    subset_pool_len++;
+  }
   return list;
+}
+
+static Bitboard subset_at(const SubsetList *list, int idx)
+{
+  return subset_pool[list->offset + (uint32_t)idx];
+}
+
+static unsigned char subset_stabilizer_at(const SubsetList *list, int idx)
+{
+  return subset_stabilizer_pool[list->offset + (uint32_t)idx];
 }
 
 void init(void)
@@ -629,12 +683,14 @@ static uint64_t count_compact(unsigned char group_mask,
         unsigned char new_allow[BOARD_SIDE + 1];
         unsigned char occupied[BOARD_SIDE + 1];
         unsigned char remaining_allow[BOARD_SIDE + 1];
-        int used = bitcount(subsets->subset[j]);
+        Bitboard subset = subset_at(subsets, j);
+        unsigned char subset_stabilizer = subset_stabilizer_at(subsets, j);
+        int used = bitcount(subset);
         uint32_t new_sig = rem_after_use(rem_sig, used);
-        int k = subgroup_index(subsets->stabilizer[j]);
+        int k = subgroup_index(subset_stabilizer);
 
         decompose_counts(h, k, empty_by_size, new_empty);
-        count_suborbits(subsets->subset[j], k, occupied);
+        count_suborbits(subset, k, occupied);
         for (int s = 1; s <= BOARD_SIDE; s++) {
           new_empty[s] -= occupied[s];
         }
@@ -653,7 +709,7 @@ static uint64_t count_compact(unsigned char group_mask,
           memcpy(new_allow, new_empty, sizeof(new_allow));
         }
 
-        total += count_compact(subsets->stabilizer[j], new_empty, new_allow,
+        total += count_compact(subset_stabilizer, new_empty, new_allow,
             new_sig);
       }
     }
@@ -815,8 +871,11 @@ static uint64_t rank_state(Context *ctx, Bitboard target[],
       continue;
     }
     for (int j = 0; j < subsets->n; j++) {
-      if (i == actual_orbit && subsets->subset[j] == actual_subset) {
-        rank += rank_state(ctx, target, subsets->stabilizer[j],
+      Bitboard subset = subset_at(subsets, j);
+      unsigned char subset_stabilizer = subset_stabilizer_at(subsets, j);
+
+      if (i == actual_orbit && subset == actual_subset) {
+        rank += rank_state(ctx, target, subset_stabilizer,
             occ | actual_subset,
             r - bitcount(actual_subset) > 0
                 ? remaining_allow(allow, &orbits, actual_orbit)
@@ -826,9 +885,9 @@ static uint64_t rank_state(Context *ctx, Bitboard target[],
         return rank;
       }
       if (i < actual_orbit ||
-          (i == actual_orbit && subsets->subset[j] < actual_subset)) {
+          (i == actual_orbit && subset < actual_subset)) {
         rank += count_after_subset(ctx, occ, g, r, &orbits, i, allow,
-            subsets->subset[j], subsets->stabilizer[j]);
+            subset, subset_stabilizer);
       }
     }
   }
@@ -897,21 +956,23 @@ static void unrank_state(Context *ctx, uint64_t *rk, Bitboard group[],
       continue;
     }
     for (int j = 0; j < subsets->n; j++) {
+      Bitboard subset = subset_at(subsets, j);
+      unsigned char subset_stabilizer = subset_stabilizer_at(subsets, j);
       uint64_t count = count_after_subset(ctx, occ, g, r, &orbits, i, allow,
-          subsets->subset[j], subsets->stabilizer[j]);
+          subset, subset_stabilizer);
 
       if (*rk >= count) {
         *rk -= count;
         continue;
       }
 
-      group[g] |= subsets->subset[j];
-      unrank_state(ctx, rk, group, subsets->stabilizer[j],
-          occ | subsets->subset[j],
-          r - bitcount(subsets->subset[j]) > 0
+      group[g] |= subset;
+      unrank_state(ctx, rk, group, subset_stabilizer,
+          occ | subset,
+          r - bitcount(subset) > 0
               ? remaining_allow(allow, &orbits, i)
               : 0,
-          g, r - bitcount(subsets->subset[j]));
+          g, r - bitcount(subset));
       return;
     }
   }
