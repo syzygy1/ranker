@@ -83,33 +83,27 @@ static int initialized;
 
 static int bitcount(Bitboard b)
 {
-  int n = 0;
-
-  while (b) {
-    b &= b - 1;
-    n++;
-  }
-  return n;
+  return __builtin_popcountll(b);
 }
 
 static int first_square(Bitboard b)
 {
-  for (int sq = 0; sq < BOARD_SIZE; sq++) {
-    if (b & ((Bitboard)1 << sq)) {
-      return sq;
-    }
+  if (!b) {
+    return -1;
   }
-  return -1;
+  return __builtin_ctzll(b);
 }
 
 static int take_square(Bitboard *b)
 {
-  int sq = first_square(*b);
+  Bitboard x = *b;
+  int sq;
 
-  if (sq < 0) {
+  if (!x) {
     abort();
   }
-  *b &= ~((Bitboard)1 << sq);
+  sq = __builtin_ctzll(x);
+  *b = x & (x - 1);
   return sq;
 }
 
