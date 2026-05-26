@@ -11,7 +11,7 @@ typedef uint64_t Bitboard;
 #define D8_SIZE 8
 #define FULL_D8 0xff
 #define MAX_GROUPS 16
-#define MAX_ORBITS 64
+#define MAX_ORBITS 36
 #define MAX_SUBSETS 256
 #define SUBGROUP_COUNT 10
 #define MAX_PIECES 8
@@ -78,6 +78,7 @@ static unsigned char decomp_by_size[SUBGROUP_COUNT][SUBGROUP_COUNT]
 static CountEntry *count_table;
 static size_t count_table_len;
 static size_t count_table_cap;
+static uint64_t binom[BOARD_SIZE + 1][MAX_PIECES + 1];
 static int prebuilding_counts;
 static int initialized;
 
@@ -196,6 +197,12 @@ static OrbitList build_empty_orbits(unsigned char group_mask)
 static void count_suborbits(Bitboard set, int subgroup, unsigned char out[])
 {
   memset(out, 0, BOARD_SIDE + 1);
+
+  if (subgroup_mask[subgroup] == 0x01) {
+    out[1] = (unsigned char)bitcount(set);
+    return;
+  }
+
   for (int i = 0; i < subgroup_orbits[subgroup].n; i++) {
     const Orbit *orbit = &subgroup_orbits[subgroup].orbit[i];
 
@@ -320,16 +327,27 @@ void init(void)
   if (initialized) {
     return;
   }
+  for (int n = 0; n <= BOARD_SIZE; n++) {
+    binom[n][0] = 1;
+    for (int k = 1; k <= MAX_PIECES && k <= n; k++) {
+      binom[n][k] = binom[n - 1][k - 1] + binom[n - 1][k];
+    }
+  }
   for (int t = 0; t < D8_SIZE; t++) {
     for (int sq = 0; sq < BOARD_SIZE; sq++) {
       map[t][sq] = transform_square_raw(sq, t);
     }
   }
   for (int i = 0; i < SUBGROUP_COUNT; i++) {
-    subgroup_orbits[i] = build_empty_orbits(subgroup_mask[i]);
+    if (subgroup_mask[i] != 0x01) {
+      subgroup_orbits[i] = build_empty_orbits(subgroup_mask[i]);
+    }
   }
   build_decomposition_tables();
   for (int s = 0; s < SUBGROUP_COUNT; s++) {
+    if (subgroup_mask[s] == 0x01) {
+      continue;
+    }
     for (int o = 0; o < subgroup_orbits[s].n; o++) {
       for (int max_pieces = 0; max_pieces <= BOARD_SIDE; max_pieces++) {
         subset_cache[s][o][max_pieces] = build_canonical_subsets(
@@ -386,6 +404,11 @@ static OrbitList make_orbits(unsigned char group_mask, Bitboard occ)
 {
   OrbitList list;
   const OrbitList *empty = &subgroup_orbits[subgroup_index(group_mask)];
+
+  if (group_mask == 0x01) {
+    fprintf(stderr, "internal error: identity orbits should be handled directly\n");
+    exit(1);
+  }
 
   memset(&list, 0, sizeof(list));
   for (int i = 0; i < empty->n; i++) {
@@ -485,6 +508,14 @@ static Bitboard remaining_allow(Bitboard allow, const OrbitList *orbits,
     blocked |= orbits->orbit[i].bb;
   }
   return allow & ~blocked;
+}
+
+static Bitboard later_squares(int sq)
+{
+  if (sq >= BOARD_SIZE - 1) {
+    return 0;
+  }
+  return ~(Bitboard)0 << (sq + 1);
 }
 
 static uint64_t count_state(Context *ctx, unsigned char group_mask,
@@ -626,6 +657,31 @@ static void decompose_counts(int h, int k, const unsigned char old_counts[],
   }
 }
 
+static uint64_t count_identity(const unsigned char empty_by_size[],
+    const unsigned char allow_by_size[], uint32_t rem_sig)
+{
+  int empty = empty_by_size[1];
+  int allowed = allow_by_size[1];
+  uint64_t count = 1;
+  int len = rem_len(rem_sig);
+
+  for (int i = 0; i < len; i++) {
+    int n = i == 0 ? allowed : empty;
+    int r = rem_at(rem_sig, i);
+
+    if (r > n) {
+      return 0;
+    }
+    count *= binom[n][r];
+    empty -= r;
+    if (i == 0) {
+      allowed = empty;
+    }
+  }
+
+  return count;
+}
+
 static uint64_t count_compact(unsigned char group_mask,
     const unsigned char empty_by_size[],
     const unsigned char allow_by_size[], uint32_t rem_sig)
@@ -638,6 +694,9 @@ static uint64_t count_compact(unsigned char group_mask,
 
   if (rem_len(rem_sig) == 0) {
     return 1;
+  }
+  if (group_mask == 0x01) {
+    return count_identity(empty_by_size, allow_by_size, rem_sig);
   }
 
   entry = find_count_entry(group_mask, rem_sig, empty_by_size, allow_by_size,
@@ -779,8 +838,15 @@ static uint64_t count_state(Context *ctx, unsigned char group_mask,
     allow = ~occ;
   }
 
-  orbits = make_orbits(group_mask, occ);
-  make_memo_counts(&orbits, allow, empty_by_size, allow_by_size);
+  if (group_mask == 0x01) {
+    memset(empty_by_size, 0, sizeof(empty_by_size));
+    memset(allow_by_size, 0, sizeof(allow_by_size));
+    empty_by_size[1] = (unsigned char)bitcount(~occ);
+    allow_by_size[1] = (unsigned char)bitcount(allow & ~occ);
+  } else {
+    orbits = make_orbits(group_mask, occ);
+    make_memo_counts(&orbits, allow, empty_by_size, allow_by_size);
+  }
   rem_sig = make_rem_sig_from_context(ctx, g, r);
   return count_compact(group_mask, empty_by_size, allow_by_size, rem_sig);
 }
@@ -811,6 +877,57 @@ static int fill_groups_from_squares(int n, const int mult[], const int sq[],
   return 1;
 }
 
+static uint64_t rank_identity(Context *ctx, Bitboard target[], Bitboard occ,
+    Bitboard allow, int g, int r, int *valid)
+{
+  Bitboard remaining;
+  Bitboard bad;
+  int actual_sq;
+  uint64_t rank = 0;
+
+  if (r == 0) {
+    g++;
+    if (g == ctx->n) {
+      return 0;
+    }
+    r = ctx->mult[g];
+    allow = ~occ;
+  }
+
+  remaining = target[g] & ~occ;
+  bad = remaining & ~allow;
+  if (bad) {
+    *valid = 0;
+    return 0;
+  }
+
+  actual_sq = first_square(remaining & allow);
+  if (actual_sq < 0) {
+    *valid = 0;
+    return 0;
+  }
+
+  for (int sq = first_square(allow & ~occ); sq >= 0; ) {
+    Bitboard bit = (Bitboard)1 << sq;
+    Bitboard rest = (allow & ~occ) & later_squares(sq);
+    int next_sq;
+
+    if (sq == actual_sq) {
+      rank += rank_identity(ctx, target, occ | bit,
+          r - 1 > 0 ? rest : 0, g, r - 1, valid);
+      return rank;
+    }
+
+    rank += count_state(ctx, 0x01, occ | bit, r - 1 > 0 ? rest : 0, g,
+        r - 1);
+    next_sq = first_square(rest);
+    sq = next_sq;
+  }
+
+  *valid = 0;
+  return 0;
+}
+
 static uint64_t rank_state(Context *ctx, Bitboard target[],
     unsigned char group_mask, Bitboard occ, Bitboard allow, int g, int r,
     int *valid)
@@ -827,6 +944,10 @@ static uint64_t rank_state(Context *ctx, Bitboard target[],
     }
     r = ctx->mult[g];
     allow = ~occ;
+  }
+
+  if (group_mask == 0x01) {
+    return rank_identity(ctx, target, occ, allow, g, r, valid);
   }
 
   orbits = make_orbits(group_mask, occ);
@@ -939,6 +1060,31 @@ static void unrank_state(Context *ctx, uint64_t *rk, Bitboard group[],
     }
     r = ctx->mult[g];
     allow = ~occ;
+  }
+
+  if (group_mask == 0x01) {
+    Bitboard choices = allow & ~occ;
+
+    while (choices) {
+      int sq = take_square(&choices);
+      Bitboard bit = (Bitboard)1 << sq;
+      Bitboard rest = (allow & ~occ) & later_squares(sq);
+      uint64_t count = count_state(ctx, 0x01, occ | bit,
+          r - 1 > 0 ? rest : 0, g, r - 1);
+
+      if (*rk >= count) {
+        *rk -= count;
+        continue;
+      }
+
+      group[g] |= bit;
+      unrank_state(ctx, rk, group, 0x01, occ | bit,
+          r - 1 > 0 ? rest : 0, g, r - 1);
+      return;
+    }
+
+    fprintf(stderr, "internal error: identity rank not consumed\n");
+    exit(1);
   }
 
   orbits = make_orbits(group_mask, occ);
