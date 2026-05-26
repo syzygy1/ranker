@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <immintrin.h>
 
 typedef uint64_t Bitboard;
 
@@ -32,6 +33,16 @@ typedef struct {
   uint32_t offset;
   unsigned short n;
 } SubsetList;
+
+typedef struct {
+  uint32_t offset;
+  unsigned short n;
+} PatternList;
+
+typedef struct {
+  Bitboard canonical;
+  unsigned char transform;
+} PatternEntry;
 
 typedef struct {
   Bitboard subset[MAX_SUBSETS];
@@ -68,10 +79,14 @@ static const unsigned char subgroup_mask[SUBGROUP_COUNT] = {
 };
 static OrbitList subgroup_orbits[SUBGROUP_COUNT];
 static SubsetList subset_cache[SUBGROUP_COUNT][MAX_ORBITS][BOARD_SIDE + 1];
+static PatternList pattern_cache[SUBGROUP_COUNT][MAX_ORBITS];
 static Bitboard *subset_pool;
 static unsigned char *subset_stabilizer_pool;
 static size_t subset_pool_len;
 static size_t subset_pool_cap;
+static PatternEntry *pattern_pool;
+static size_t pattern_pool_len;
+static size_t pattern_pool_cap;
 static unsigned char orbit_idx_by_size[SUBGROUP_COUNT][BOARD_SIDE + 1];
 static unsigned char decomp_by_size[SUBGROUP_COUNT][SUBGROUP_COUNT]
     [BOARD_SIDE + 1][BOARD_SIDE + 1];
@@ -273,6 +288,60 @@ static void reserve_subset_pool(size_t n)
   }
 }
 
+static void reserve_pattern_pool(size_t n)
+{
+  if (pattern_pool_len + n > pattern_pool_cap) {
+    size_t new_cap = pattern_pool_cap ? 2 * pattern_pool_cap : 4096;
+    PatternEntry *new_pattern;
+
+    while (new_cap < pattern_pool_len + n) {
+      new_cap *= 2;
+    }
+    new_pattern = realloc(pattern_pool, new_cap * sizeof(*new_pattern));
+    if (!new_pattern) {
+      fprintf(stderr, "out of memory while building subset pattern table\n");
+      exit(1);
+    }
+    pattern_pool = new_pattern;
+    pattern_pool_cap = new_cap;
+  }
+}
+
+static PatternList build_subset_patterns(Bitboard orbit,
+    unsigned char group_mask)
+{
+  PatternList list;
+  size_t n = (size_t)1 << bitcount(orbit);
+
+  reserve_pattern_pool(n);
+  list.offset = (uint32_t)pattern_pool_len;
+  list.n = (unsigned short)n;
+  for (size_t i = 0; i < n; i++) {
+    PatternEntry *entry = &pattern_pool[pattern_pool_len + i];
+    Bitboard subset = _pdep_u64((Bitboard)i, orbit);
+    int best_t = -1;
+
+    entry->canonical = 0;
+    entry->transform = 0;
+    for (int t = 0; t < D8_SIZE; t++) {
+      if (group_mask & (1u << t)) {
+        Bitboard cur = transform_bb(subset, t);
+
+        if (best_t < 0 || cur < entry->canonical) {
+          entry->canonical = cur;
+          entry->transform = (unsigned char)t;
+          best_t = t;
+        }
+      }
+    }
+    if (best_t < 0) {
+      abort();
+    }
+  }
+  pattern_pool_len += n;
+  return list;
+}
+
 static SubsetList build_canonical_subsets(Bitboard orbit, int max_pieces,
     unsigned char group_mask)
 {
@@ -349,6 +418,8 @@ void init(void)
       continue;
     }
     for (int o = 0; o < subgroup_orbits[s].n; o++) {
+      pattern_cache[s][o] = build_subset_patterns(
+          subgroup_orbits[s].orbit[o].bb, subgroup_mask[s]);
       for (int max_pieces = 0; max_pieces <= BOARD_SIDE; max_pieces++) {
         subset_cache[s][o][max_pieces] = build_canonical_subsets(
             subgroup_orbits[s].orbit[o].bb, max_pieces, subgroup_mask[s]);
@@ -400,36 +471,6 @@ static void free_context(Context *ctx)
   memset(ctx, 0, sizeof(*ctx));
 }
 
-static OrbitList make_orbits(unsigned char group_mask, Bitboard occ)
-{
-  OrbitList list;
-  const OrbitList *empty = &subgroup_orbits[subgroup_index(group_mask)];
-
-  if (group_mask == 0x01) {
-    fprintf(stderr, "internal error: identity orbits should be handled directly\n");
-    exit(1);
-  }
-
-  memset(&list, 0, sizeof(list));
-  for (int i = 0; i < empty->n; i++) {
-    Bitboard orbit = empty->orbit[i].bb;
-
-    if (orbit & occ) {
-      if ((orbit & occ) != orbit) {
-        fprintf(stderr, "internal error: occupancy is not subgroup-invariant\n");
-        exit(1);
-      }
-      continue;
-    }
-    list.orbit[list.n].bb = orbit;
-    list.orbit[list.n].size = empty->orbit[i].size;
-    list.orbit[list.n].min_sq = empty->orbit[i].min_sq;
-    list.orbit[list.n].cache_idx = empty->orbit[i].cache_idx;
-    list.n++;
-  }
-  return list;
-}
-
 static Bitboard canonical_bb(Bitboard bb, unsigned char group_mask)
 {
   Bitboard best = 0;
@@ -449,31 +490,23 @@ static Bitboard canonical_bb(Bitboard bb, unsigned char group_mask)
 }
 
 static Bitboard canonicalize_target(Bitboard target[], int n,
-    unsigned char group_mask, Bitboard subset)
+    unsigned char group_mask, const Orbit *orbit, Bitboard subset)
 {
-  Bitboard best = 0;
-  int best_t = -1;
+  const PatternList *list =
+      &pattern_cache[subgroup_index(group_mask)][orbit->cache_idx];
+  uint64_t idx = _pext_u64(subset, orbit->bb);
+  const PatternEntry *entry;
 
-  for (int t = 0; t < D8_SIZE; t++) {
-    if (group_mask & (1u << t)) {
-      Bitboard cur = transform_bb(subset, t);
-
-      if (best_t < 0 || cur < best) {
-        best = cur;
-        best_t = t;
-      }
-    }
-  }
-
-  if (best_t < 0) {
+  if (idx >= list->n) {
     abort();
   }
-  if (best != subset) {
+  entry = &pattern_pool[list->offset + (uint32_t)idx];
+  if (entry->canonical != subset) {
     for (int g = 0; g < n; g++) {
-      target[g] = transform_bb(target[g], best_t);
+      target[g] = transform_bb(target[g], entry->transform);
     }
   }
-  return best;
+  return entry->canonical;
 }
 
 static const SubsetList *canonical_subsets(unsigned char group_mask,
@@ -510,16 +543,38 @@ static Bitboard remaining_allow(Bitboard allow, const OrbitList *orbits,
   return allow & ~blocked;
 }
 
-static Bitboard later_squares(int sq)
+static int orbit_is_occupied(const Orbit *orbit, Bitboard occ)
 {
-  if (sq >= BOARD_SIZE - 1) {
+  Bitboard here = orbit->bb & occ;
+
+  if (!here) {
     return 0;
   }
-  return ~(Bitboard)0 << (sq + 1);
+  if (here != orbit->bb) {
+    fprintf(stderr, "internal error: occupancy is not subgroup-invariant\n");
+    exit(1);
+  }
+  return 1;
+}
+
+static Bitboard choice_bit(Bitboard choices, int pos)
+{
+  return _pdep_u64((Bitboard)1 << pos, choices);
+}
+
+static Bitboard choices_after(Bitboard choices, int pos)
+{
+  if (pos >= BOARD_SIZE - 1) {
+    return 0;
+  }
+  return _pdep_u64(~(Bitboard)0 << (pos + 1), choices);
 }
 
 static uint64_t count_state(Context *ctx, unsigned char group_mask,
     Bitboard occ, Bitboard allow, int g, int r);
+
+static uint64_t count_identity_state(Context *ctx, Bitboard occ,
+    Bitboard allow, int g, int r);
 
 static uint64_t count_compact(unsigned char group_mask,
     const unsigned char empty_by_size[],
@@ -538,10 +593,14 @@ static uint64_t count_after_subset(Context *ctx, Bitboard occ, int g, int r,
   if (new_r > 0) {
     new_allow = remaining_allow(allow, orbits, orbit_idx);
   }
+  if (new_group == 0x01) {
+    return count_identity_state(ctx, new_occ, new_allow, g, new_r);
+  }
   return count_state(ctx, new_group, new_occ, new_allow, g, new_r);
 }
 
-static void make_memo_counts(const OrbitList *orbits, Bitboard allow,
+static void make_memo_counts(const OrbitList *orbits, Bitboard occ,
+    Bitboard allow,
     unsigned char empty_by_size[], unsigned char allow_by_size[])
 {
   memset(empty_by_size, 0, BOARD_SIDE + 1);
@@ -550,8 +609,11 @@ static void make_memo_counts(const OrbitList *orbits, Bitboard allow,
   for (int i = 0; i < orbits->n; i++) {
     const Orbit *orbit = &orbits->orbit[i];
 
+    if (orbit_is_occupied(orbit, occ)) {
+      continue;
+    }
     empty_by_size[orbit->size]++;
-    if ((orbit->bb & ~allow) == 0) {
+    if ((orbit->bb & (occ | ~allow)) == 0) {
       allow_by_size[orbit->size]++;
     } else if (orbit->bb & allow) {
       fprintf(stderr, "internal error: allow mask splits a subgroup orbit\n");
@@ -657,11 +719,8 @@ static void decompose_counts(int h, int k, const unsigned char old_counts[],
   }
 }
 
-static uint64_t count_identity(const unsigned char empty_by_size[],
-    const unsigned char allow_by_size[], uint32_t rem_sig)
+static uint64_t count_identity(int empty, int allowed, uint32_t rem_sig)
 {
-  int empty = empty_by_size[1];
-  int allowed = allow_by_size[1];
   uint64_t count = 1;
   int len = rem_len(rem_sig);
 
@@ -696,7 +755,8 @@ static uint64_t count_compact(unsigned char group_mask,
     return 1;
   }
   if (group_mask == 0x01) {
-    return count_identity(empty_by_size, allow_by_size, rem_sig);
+    fprintf(stderr, "internal error: identity count sent to compact table\n");
+    exit(1);
   }
 
   entry = find_count_entry(group_mask, rem_sig, empty_by_size, allow_by_size,
@@ -762,8 +822,12 @@ static uint64_t count_compact(unsigned char group_mask,
           memcpy(new_allow, new_empty, sizeof(new_allow));
         }
 
-        total += count_compact(subset_stabilizer, new_empty, new_allow,
-            new_sig);
+        if (subset_stabilizer == 0x01) {
+          total += count_identity(new_empty[1], new_allow[1], new_sig);
+        } else {
+          total += count_compact(subset_stabilizer, new_empty, new_allow,
+              new_sig);
+        }
       }
     }
   }
@@ -821,10 +885,32 @@ static void build_completion_tables(void)
   prebuilding_counts = 0;
 }
 
+static uint64_t count_identity_state(Context *ctx, Bitboard occ,
+    Bitboard allow, int g, int r)
+{
+  int empty;
+  int allowed;
+  uint32_t rem_sig;
+
+  if (r == 0) {
+    g++;
+    if (g == ctx->n) {
+      return 1;
+    }
+    r = ctx->mult[g];
+    allow = ~occ;
+  }
+
+  empty = bitcount(~occ);
+  allowed = bitcount(allow & ~occ);
+  rem_sig = make_rem_sig_from_context(ctx, g, r);
+  return count_identity(empty, allowed, rem_sig);
+}
+
 static uint64_t count_state(Context *ctx, unsigned char group_mask,
     Bitboard occ, Bitboard allow, int g, int r)
 {
-  OrbitList orbits;
+  const OrbitList *orbits;
   unsigned char empty_by_size[BOARD_SIDE + 1];
   unsigned char allow_by_size[BOARD_SIDE + 1];
   uint32_t rem_sig;
@@ -839,14 +925,12 @@ static uint64_t count_state(Context *ctx, unsigned char group_mask,
   }
 
   if (group_mask == 0x01) {
-    memset(empty_by_size, 0, sizeof(empty_by_size));
-    memset(allow_by_size, 0, sizeof(allow_by_size));
-    empty_by_size[1] = (unsigned char)bitcount(~occ);
-    allow_by_size[1] = (unsigned char)bitcount(allow & ~occ);
-  } else {
-    orbits = make_orbits(group_mask, occ);
-    make_memo_counts(&orbits, allow, empty_by_size, allow_by_size);
+    fprintf(stderr, "internal error: identity count sent to count_state\n");
+    exit(1);
   }
+
+  orbits = &subgroup_orbits[subgroup_index(group_mask)];
+  make_memo_counts(orbits, occ, allow, empty_by_size, allow_by_size);
   rem_sig = make_rem_sig_from_context(ctx, g, r);
   return count_compact(group_mask, empty_by_size, allow_by_size, rem_sig);
 }
@@ -880,9 +964,10 @@ static int fill_groups_from_squares(int n, const int mult[], const int sq[],
 static uint64_t rank_identity(Context *ctx, Bitboard target[], Bitboard occ,
     Bitboard allow, int g, int r, int *valid)
 {
+  Bitboard choices;
   Bitboard remaining;
-  Bitboard bad;
-  int actual_sq;
+  Bitboard packed_remaining;
+  int actual_pos;
   uint64_t rank = 0;
 
   if (r == 0) {
@@ -894,34 +979,32 @@ static uint64_t rank_identity(Context *ctx, Bitboard target[], Bitboard occ,
     allow = ~occ;
   }
 
+  choices = allow & ~occ;
   remaining = target[g] & ~occ;
-  bad = remaining & ~allow;
-  if (bad) {
+  if (remaining & ~choices) {
     *valid = 0;
     return 0;
   }
 
-  actual_sq = first_square(remaining & allow);
-  if (actual_sq < 0) {
+  packed_remaining = _pext_u64(remaining, choices);
+  if (!packed_remaining) {
     *valid = 0;
     return 0;
   }
+  actual_pos = __builtin_ctzll(packed_remaining);
 
-  for (int sq = first_square(allow & ~occ); sq >= 0; ) {
-    Bitboard bit = (Bitboard)1 << sq;
-    Bitboard rest = (allow & ~occ) & later_squares(sq);
-    int next_sq;
+  for (int pos = 0; pos <= actual_pos; pos++) {
+    Bitboard bit = choice_bit(choices, pos);
+    Bitboard rest = choices_after(choices, pos);
 
-    if (sq == actual_sq) {
+    if (pos == actual_pos) {
       rank += rank_identity(ctx, target, occ | bit,
           r - 1 > 0 ? rest : 0, g, r - 1, valid);
       return rank;
     }
 
-    rank += count_state(ctx, 0x01, occ | bit, r - 1 > 0 ? rest : 0, g,
+    rank += count_identity_state(ctx, occ | bit, r - 1 > 0 ? rest : 0, g,
         r - 1);
-    next_sq = first_square(rest);
-    sq = next_sq;
   }
 
   *valid = 0;
@@ -932,7 +1015,7 @@ static uint64_t rank_state(Context *ctx, Bitboard target[],
     unsigned char group_mask, Bitboard occ, Bitboard allow, int g, int r,
     int *valid)
 {
-  OrbitList orbits;
+  const OrbitList *orbits;
   int actual_orbit = -1;
   Bitboard actual_subset = 0;
   uint64_t rank = 0;
@@ -950,19 +1033,23 @@ static uint64_t rank_state(Context *ctx, Bitboard target[],
     return rank_identity(ctx, target, occ, allow, g, r, valid);
   }
 
-  orbits = make_orbits(group_mask, occ);
+  orbits = &subgroup_orbits[subgroup_index(group_mask)];
 
-  for (int i = 0; i < orbits.n; i++) {
-    if ((orbits.orbit[i].bb & ~allow) && (target[g] & orbits.orbit[i].bb)) {
+  for (int i = 0; i < orbits->n; i++) {
+    const Orbit *orbit = &orbits->orbit[i];
+
+    if ((orbit->bb & (occ | ~allow)) && (target[g] & orbit->bb)) {
       *valid = 0;
       return 0;
     }
   }
 
-  for (int i = 0; i < orbits.n; i++) {
-    Bitboard here = target[g] & orbits.orbit[i].bb;
+  for (int i = 0; i < orbits->n; i++) {
+    const Orbit *orbit = &orbits->orbit[i];
+    Bitboard here;
 
-    if (orbits.orbit[i].bb & ~allow) {
+    here = target[g] & orbit->bb;
+    if (orbit->bb & (occ | ~allow)) {
       continue;
     }
     if (here) {
@@ -976,13 +1063,14 @@ static uint64_t rank_state(Context *ctx, Bitboard target[],
     return 0;
   }
   actual_subset = canonicalize_target(target, ctx->n, group_mask,
-      actual_subset);
+      &orbits->orbit[actual_orbit], actual_subset);
 
   for (int i = 0; i <= actual_orbit; i++) {
+    const Orbit *orbit = &orbits->orbit[i];
     const SubsetList *subsets = canonical_subsets(group_mask,
-        &orbits.orbit[i], r);
+        orbit, r);
 
-    if (orbits.orbit[i].bb & ~allow) {
+    if (orbit->bb & (occ | ~allow)) {
       continue;
     }
     for (int j = 0; j < subsets->n; j++) {
@@ -993,7 +1081,7 @@ static uint64_t rank_state(Context *ctx, Bitboard target[],
         rank += rank_state(ctx, target, subset_stabilizer,
             occ | actual_subset,
             r - bitcount(actual_subset) > 0
-                ? remaining_allow(allow, &orbits, actual_orbit)
+                ? remaining_allow(allow, orbits, actual_orbit)
                 : 0,
             g, r - bitcount(actual_subset),
             valid);
@@ -1001,7 +1089,7 @@ static uint64_t rank_state(Context *ctx, Bitboard target[],
       }
       if (i < actual_orbit ||
           (i == actual_orbit && subset < actual_subset)) {
-        rank += count_after_subset(ctx, occ, g, r, &orbits, i, allow,
+        rank += count_after_subset(ctx, occ, g, r, orbits, i, allow,
             subset, subset_stabilizer);
       }
     }
@@ -1051,7 +1139,7 @@ uint64_t count_unique_positions(int n, int mult[])
 static void unrank_state(Context *ctx, uint64_t *rk, Bitboard group[],
     unsigned char group_mask, Bitboard occ, Bitboard allow, int g, int r)
 {
-  OrbitList orbits;
+  const OrbitList *orbits;
 
   if (r == 0) {
     g++;
@@ -1064,12 +1152,12 @@ static void unrank_state(Context *ctx, uint64_t *rk, Bitboard group[],
 
   if (group_mask == 0x01) {
     Bitboard choices = allow & ~occ;
+    int nchoices = bitcount(choices);
 
-    while (choices) {
-      int sq = take_square(&choices);
-      Bitboard bit = (Bitboard)1 << sq;
-      Bitboard rest = (allow & ~occ) & later_squares(sq);
-      uint64_t count = count_state(ctx, 0x01, occ | bit,
+    for (int pos = 0; pos < nchoices; pos++) {
+      Bitboard bit = choice_bit(choices, pos);
+      Bitboard rest = choices_after(choices, pos);
+      uint64_t count = count_identity_state(ctx, occ | bit,
           r - 1 > 0 ? rest : 0, g, r - 1);
 
       if (*rk >= count) {
@@ -1087,18 +1175,19 @@ static void unrank_state(Context *ctx, uint64_t *rk, Bitboard group[],
     exit(1);
   }
 
-  orbits = make_orbits(group_mask, occ);
-  for (int i = 0; i < orbits.n; i++) {
+  orbits = &subgroup_orbits[subgroup_index(group_mask)];
+  for (int i = 0; i < orbits->n; i++) {
+    const Orbit *orbit = &orbits->orbit[i];
     const SubsetList *subsets = canonical_subsets(group_mask,
-        &orbits.orbit[i], r);
+        orbit, r);
 
-    if (orbits.orbit[i].bb & ~allow) {
+    if (orbit->bb & (occ | ~allow)) {
       continue;
     }
     for (int j = 0; j < subsets->n; j++) {
       Bitboard subset = subset_at(subsets, j);
       unsigned char subset_stabilizer = subset_stabilizer_at(subsets, j);
-      uint64_t count = count_after_subset(ctx, occ, g, r, &orbits, i, allow,
+      uint64_t count = count_after_subset(ctx, occ, g, r, orbits, i, allow,
           subset, subset_stabilizer);
 
       if (*rk >= count) {
@@ -1110,7 +1199,7 @@ static void unrank_state(Context *ctx, uint64_t *rk, Bitboard group[],
       unrank_state(ctx, rk, group, subset_stabilizer,
           occ | subset,
           r - bitcount(subset) > 0
-              ? remaining_allow(allow, &orbits, i)
+              ? remaining_allow(allow, orbits, i)
               : 0,
           g, r - bitcount(subset));
       return;
@@ -1245,6 +1334,31 @@ int main(int argc, char *argv[])
     int mult[] = { 2, 1 };
     int sq[] = { 0, 7, 28 };
     ok &= test_case(2, mult, sq);
+  }
+  {
+    int mult[] = { 4 };
+    int sq[] = { 1, 12, 39, 58 };
+    ok &= test_case(1, mult, sq);
+  }
+  {
+    int mult[] = { 3, 2 };
+    int sq[] = { 1, 2, 18, 19, 26 };
+    ok &= test_case(2, mult, sq);
+  }
+  {
+    int mult[] = { 2, 2, 2 };
+    int sq[] = { 0, 1, 14, 46, 20, 31 };
+    ok &= test_case(3, mult, sq);
+  }
+  {
+    int mult[] = { 3, 2, 1, 1 };
+    int sq[] = { 0, 1, 2, 15, 47, 31, 48 };
+    ok &= test_case(4, mult, sq);
+  }
+  {
+    int mult[] = { 2, 2, 2, 1, 1 };
+    int sq[] = { 0, 1, 2, 3, 25, 42, 40, 29 };
+    ok &= test_case(5, mult, sq);
   }
 
   return ok ? 0 : 1;

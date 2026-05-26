@@ -1,5 +1,5 @@
 CC ?= cc
-CFLAGS ?= -std=c11 -Wall -Wextra -pedantic
+CFLAGS ?= -std=c11 -Wall -Wextra -pedantic -mbmi2
 
 TARGET = perfect
 SRC = perfect.c
