@@ -262,6 +262,12 @@ static void count_suborbit_types(Bitboard set, int subgroup,
   }
 }
 
+// FIXME: ensure that the orbits for a subgroup are listed ordered by
+// orbit type. This allows the state for the remaining pieces in the current
+// subgroup to be fully described by the (allowed) orbit type from where
+// to (re)start placing pieces and the allowed number of orbits of that
+// type. (The number of allowed orbits of higher orbit types will then be
+// equal to the number of empty orbits of those higher orbit types.)
 static void assign_orbit_types(void)
 {
   memset(orbit_type_rep, 0xff, sizeof(orbit_type_rep));
@@ -701,6 +707,9 @@ static void make_compact_orbit_counts(const OrbitList *orbits, Bitboard occ,
   }
 }
 
+// TODO: rem_sig should be independent of the order of the remaining
+// multiplicities. There are probably at most 45 possibilities for
+// remaining mult[] and r, so rem_sig can be encoded in 1 byte.
 static uint32_t make_rem_sig_from_context(const Context *ctx, int g, int r)
 {
   uint32_t sig;
@@ -1152,6 +1161,10 @@ static uint64_t rank_state(Context *ctx, Bitboard target[],
     }
   }
 
+  // TODO: Look for a first way to find the first orbit than by looping
+  // through them. The best way might be to loop through the squares
+  // in target[g] and have a precomputed uint8_t[64] per subgroup which
+  // contains the orbit_id for each square.
   for (int i = 0; i < orbits->n; i++) {
     const Orbit *orbit = &orbits->orbit[i];
     Bitboard here;
@@ -1421,7 +1434,6 @@ static int timed_roundtrip_range(int n, int mult[])
   clock_t end;
   double seconds;
   int out[BOARD_SIZE];
-  uint64_t checksum = 0;
 
   printf("timed roundtrip ");
   for (int i = 0; i < n; i++) {
@@ -1439,13 +1451,12 @@ static int timed_roundtrip_range(int n, int mult[])
           ", rank2=%" PRIu64 "\n", rk, rk2);
       return 0;
     }
-    checksum ^= rk2;
   }
 
   end = clock();
   seconds = (double)(end - start) / CLOCKS_PER_SEC;
-  printf("  %.3f seconds, %.0f roundtrips/second, checksum %" PRIu64 "\n",
-      seconds, seconds > 0.0 ? (double)count / seconds : 0.0, checksum);
+  printf("  %.3f seconds, %.0f roundtrips/second\n",
+      seconds, seconds > 0.0 ? (double)count / seconds : 0.0);
   return 1;
 }
 
@@ -1501,8 +1512,20 @@ int main(int argc, char *argv[])
     ok &= test_case(5, mult, sq);
   }
   if (argc > 1 && strcmp(argv[1], "--timed") == 0) {
-    int mult[] = { 6 };
-    ok &= timed_roundtrip_range(1, mult);
+#if 0
+    ok &= timed_roundtrip_range(1, (int[]){ 5 });
+    ok &= timed_roundtrip_range(5, (int[]){ 1, 1, 1, 1, 1 });
+    ok &= timed_roundtrip_range(4, (int[]){ 1, 1, 1, 2 });
+    ok &= timed_roundtrip_range(4, (int[]){ 1, 1, 2, 1 });
+    ok &= timed_roundtrip_range(2, (int[]){ 4, 1});
+    ok &= timed_roundtrip_range(2, (int[]){ 1, 4});
+    ok &= timed_roundtrip_range(2, (int[]){ 3, 2});
+    ok &= timed_roundtrip_range(2, (int[]){ 2, 3});
+    ok &= timed_roundtrip_range(3, (int[]){ 2, 2, 1 });
+    ok &= timed_roundtrip_range(3, (int[]){ 2, 1, 2 });
+    ok &= timed_roundtrip_range(3, (int[]){ 1, 2, 2 });
+#endif
+    ok &= timed_roundtrip_range(1, (int[]){ 6 });
   }
 
   return ok ? 0 : 1;
